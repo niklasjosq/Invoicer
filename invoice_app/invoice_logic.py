@@ -1,29 +1,27 @@
 import datetime
-from drafthorse.models.document import Document
+from drafthorse.models.document import Document, Header
 from drafthorse.models.trade import TradeTransaction
 from drafthorse.models.tradelines import LineItem
-from drafthorse.models.party import SellerTradeParty, BuyerTradeParty
+from drafthorse.models.party import SellerTradeParty, BuyerTradeParty, TaxRegistration
+from drafthorse.models.payment import PaymentTerms, PaymentMeans, PayeeFinancialAccount, PayeeFinancialInstitution
 from drafthorse.models.accounting import ApplicableTradeTax
 from drafthorse.models.note import IncludedNote
+
+# Monkey Patch: Remove 'Name' from Header fields as it causes validation error in EN16931 profile
+# Drafthorse defines it as required, but ZUGFeRD schema order/presence rules reject it.
+if hasattr(Header, "_fields"):
+    Header._fields = [f for f in Header._fields if f.name != "Name"]
 
 def generate_invoice_xml(data):
     """
     Generates ZUGFeRD XML from the provided data dictionary.
-    data format expected:
-    {
-        "sender": {"name": str, ...},
-        "recipient": {"name": str, ...},
-        "items": [{"Description": str, "Quantity": float, "Price": float, "Tax": float}, ...],
-        "id": str,
-        "date": datetime.date
-    }
     """
     doc = Document()
     doc.context.guideline_parameter.id = "urn:cen.eu:en16931:2017#compliant#urn:factur-x.eu:1p0:en16931"
     
     # Header
     doc.header.id = data.get("id", "INV-001")
-    # doc.header.name = "RECHNUNG"
+    # doc.header.name = "RECHNUNG" # Not allowed in EN16931
     doc.header.type_code = "380" # Commercial Invoice
     doc.header.issue_date_time = data.get("date", datetime.date.today())
     
@@ -34,14 +32,50 @@ def generate_invoice_xml(data):
     if len(seller_addr) > 0: doc.trade.agreement.seller.address.line_one = seller_addr[0]
     if len(seller_addr) > 1: doc.trade.agreement.seller.address.line_two = seller_addr[1]
     if len(seller_addr) > 2: doc.trade.agreement.seller.address.line_three = seller_addr[2]
-    doc.trade.agreement.seller.address.country_id = "DE" # Defaulting to DE for now
+    doc.trade.agreement.seller.address.country_id = "DE" # Defaulting to DE fow now
+    
+    if data.get("sender_tax_id"):
+        tr = TaxRegistration()
+        tr.id = data.get("sender_tax_id")
+        tr.id._scheme_id = "VA" # VAT ID scheme - Accessing internal as drafthorse element doesn't expose setter
+        doc.trade.agreement.seller.tax_registrations.add(tr)
 
     doc.trade.agreement.buyer.name = data["recipient"].get("name", "Unknown Buyer")
+    doc.trade.agreement.buyer.id = data.get("customer_id") # Customer ID
+    
     buyer_addr = data["recipient"].get("address_lines", [])
     if len(buyer_addr) > 0: doc.trade.agreement.buyer.address.line_one = buyer_addr[0]
     if len(buyer_addr) > 1: doc.trade.agreement.buyer.address.line_two = buyer_addr[1]
     if len(buyer_addr) > 2: doc.trade.agreement.buyer.address.line_three = buyer_addr[2]
     doc.trade.agreement.buyer.address.country_id = "DE" 
+    
+    # Delivery / Service Date
+    if data.get("delivery_date"):
+        doc.trade.delivery.event.occurrence = data.get("delivery_date")
+        
+    # Payment Terms / Due Date
+    if data.get("due_date"):
+        terms = PaymentTerms()
+        terms.due = data.get("due_date")
+        terms.description = f"Zahlbar bis zum {data.get('due_date').strftime('%d.%m.%Y')}"
+        doc.trade.settlement.terms.add(terms)
+    
+    # Bank Details
+    footer = data.get("footer", {})
+    if footer.get("iban"):
+        pm = PaymentMeans()
+        pm.type_code = "58" # SEPA Credit Transfer
+        
+        pm.payee_account.iban = footer.get("iban")
+        pm.payee_institution.bic = footer.get("bic")
+        
+        doc.trade.settlement.payment_means.add(pm)
+    
+    # Note / Subject
+    if data.get("subject"):
+        note = IncludedNote()
+        note.content = data.get("subject")
+        doc.header.notes.add(note)
     
     # Items and Totals
     total_net = 0.0
@@ -62,14 +96,6 @@ def generate_invoice_xml(data):
              net_line = qty * price
              
         tax_amount = float(item.get("Tax 19% (€)", 0) or 0)  
-        # We could recalc tax from net_line, but if user edited tax manually, we should use it?
-        # For ZUGFeRD, consistency is key. standard is 19%.
-        # If user edits Tax to be != 19% of Net, it might look weird unless we invoke a different tax category.
-        # For now, let's keep the logic: use Net Line, and assume Tax is 19% of it for the XML tax details.
-        # But wait, if user edited tax, we should probably output that tax amount?
-        # Drafthorse calculates tax automatically generally or we set it?
-        # In my code: `total_tax += net_line * (tax_percent / 100.0)`
-        # This ignores manual tax edit.
         
         # Let's use the UI's values for totals
         if tax_amount == 0 and net_line != 0:
@@ -130,18 +156,25 @@ def generate_invoice_pdf(data):
     
     # Details
     pdf.set_font("Helvetica", size=12)
-    pdf.cell(0, 10, f"Rechnungsnummer: {data.get('id', 'INV-001')}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 10, f"Datum: {data.get('date', datetime.date.today())}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(10)
+    pdf.cell(0, 6, f"Rechnungsnummer: {data.get('id', 'INV-001')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, f"Datum: {data.get('date', datetime.date.today()).strftime('%d.%m.%Y')}", new_x="LMARGIN", new_y="NEXT")
+    
+    if data.get("customer_id"):
+        pdf.cell(0, 6, f"Mieternr./Kd.-Nr.: {data.get('customer_id')}", new_x="LMARGIN", new_y="NEXT")
+
+    if data.get("delivery_date"):
+        pdf.cell(0, 6, f"Leistungsdatum: {data.get('delivery_date').strftime('%d.%m.%Y')}", new_x="LMARGIN", new_y="NEXT")
+        
+    pdf.ln(5)
     
     # Sender and Recipient
     col_width = pdf.epw / 2
     
-    pdf.set_font("Helvetica", style="B", size=12)
-    pdf.cell(col_width, 10, "Absender:", border=0)
-    pdf.cell(col_width, 10, "Empfänger:", border=0, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", style="B", size=11)
+    pdf.cell(col_width, 6, "Absender:", border=0)
+    pdf.cell(col_width, 6, "Empfänger:", border=0, new_x="LMARGIN", new_y="NEXT")
     
-    pdf.set_font("Helvetica", size=12)
+    pdf.set_font("Helvetica", size=11)
     
     # Construct full address strings
     sender_lines = [data["sender"].get("name", "")] + data["sender"].get("address_lines", [])
@@ -165,16 +198,22 @@ def generate_invoice_pdf(data):
     final_y = max(end_y_left, pdf.get_y())
     pdf.set_y(final_y + 10)
     
+    # Subject
+    if data.get("subject"):
+        pdf.set_font("Helvetica", style="B", size=12)
+        pdf.cell(0, 8, data.get("subject"), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+    
     # Table Header
-    pdf.set_font("Helvetica", style="B", size=12)
-    pdf.cell(70, 10, "Beschreibung", border=1)
-    pdf.cell(30, 10, "Menge (Std)", border=1, align="R")
-    pdf.cell(35, 10, "Preis/Std", border=1, align="R")
-    pdf.cell(30, 10, "Netto", border=1, align="R")
-    pdf.cell(25, 10, "Gesamt", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", style="B", size=10)
+    pdf.cell(70, 8, "Beschreibung", border=1)
+    pdf.cell(30, 8, "Menge", border=1, align="R")
+    pdf.cell(35, 8, "Preis/Einheit", border=1, align="R")
+    pdf.cell(30, 8, "Netto", border=1, align="R")
+    pdf.cell(25, 8, "Gesamt", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
     # Table Rows
-    pdf.set_font("Helvetica", size=12)
+    pdf.set_font("Helvetica", size=10)
     total_net = 0.0
     total_tax_accumulated = 0.0
     
@@ -195,25 +234,52 @@ def generate_invoice_pdf(data):
         total_net += net_line
         total_tax_accumulated += tax_line
         
-        pdf.cell(70, 10, desc, border=1)
-        pdf.cell(30, 10, f"{qty:.2f}", border=1, align="R")
-        pdf.cell(35, 10, f"{price:.2f}", border=1, align="R")
-        pdf.cell(30, 10, f"{net_line:.2f}", border=1, align="R")
-        pdf.cell(25, 10, f"{total_incl:.2f}", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(70, 8, desc, border=1)
+        pdf.cell(30, 8, f"{qty:.2f}", border=1, align="R")
+        pdf.cell(35, 8, f"{price:.2f}", border=1, align="R")
+        pdf.cell(30, 8, f"{net_line:.2f}", border=1, align="R")
+        pdf.cell(25, 8, f"{total_incl:.2f}", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
         
     # Total
     total_gross = total_net + total_tax_accumulated
     
     pdf.ln(5)
-    pdf.set_font("Helvetica", style="B", size=12)
-    pdf.cell(135, 10, "Summe Netto:", align="R")
-    pdf.cell(55, 10, f"{total_net:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", style="B", size=10)
+    pdf.cell(135, 8, "Summe Netto:", align="R")
+    pdf.cell(55, 8, f"{total_net:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
-    pdf.cell(135, 10, "MwSt 19%:", align="R")
-    pdf.cell(55, 10, f"{total_tax_accumulated:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(135, 8, "MwSt 19%:", align="R")
+    pdf.cell(55, 8, f"{total_tax_accumulated:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
-    pdf.cell(135, 10, "Gesamtbetrag:", align="R")
-    pdf.cell(55, 10, f"{total_gross:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(135, 8, "Gesamtbetrag:", align="R")
+    pdf.cell(55, 8, f"{total_gross:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    
+    # Payment Terms logic
+    pdf.ln(10)
+    pdf.set_font("Helvetica", size=10)
+    if data.get("due_date"):
+        pdf.cell(0, 5, f"Zahlbar ohne Abzug bis zum {data.get('due_date').strftime('%d.%m.%Y')}.", new_x="LMARGIN", new_y="NEXT")
+
+    # Footer
+    pdf.set_y(-40)
+    pdf.set_font("Helvetica", size=8)
+    footer = data.get("footer", {})
+    
+    # Footer Columns
+    # We use manual positioning for footer columns to be clean
+    base_y = pdf.get_y()
+    
+    # Col 1: Seller Name & Tax
+    pdf.set_xy(pdf.l_margin, base_y)
+    pdf.multi_cell(50, 4, f"{data['sender'].get('name', '')}\nSt.-Nr/USt-ID: {data.get('sender_tax_id', '')}")
+    
+    # Col 2: Bank
+    pdf.set_xy(pdf.l_margin + 60, base_y)
+    pdf.multi_cell(60, 4, f"Bank: {footer.get('bank_name', '')}\nIBAN: {footer.get('iban', '')}\nBIC: {footer.get('bic', '')}")
+    
+    # Col 3: Contact
+    pdf.set_xy(pdf.l_margin + 130, base_y)
+    pdf.multi_cell(50, 4, f"Kontakt:\n{footer.get('email', '')}\n{footer.get('phone', '')}")
 
     return bytes(pdf.output())
 

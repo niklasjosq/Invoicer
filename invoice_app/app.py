@@ -79,17 +79,33 @@ with tab_input:
     
     with col_details:
         sender_data = st.text_area("Sender Details (Name, Address)", height=100, key="sender_name", help="Line 1: Name\nOther lines: Address")
+        sender_tax_id = st.text_input("Sender Tax ID / VAT ID (USt-IdNr.)", key="sender_tax")
+        
         recipient_data = st.text_area("Recipient Details (Name, Address)", height=100, key="recipient_name", help="Line 1: Name\nOther lines: Address")
+        customer_id = st.text_input("Customer ID (Kundennummer)", key="customer_id")
         
     with col_dates:
         invoice_id = st.text_input("Invoice Number", key="invoice_id_manual")
         invoice_date = st.date_input("Invoice Date", key="invoice_date", value=datetime.date.today())
+        delivery_date = st.date_input("Service Date (Leistungsdatum)", key="delivery_date", value=datetime.date.today())
+        due_date = st.date_input("Due Date (Zahlungsziel)", key="due_date", value=datetime.date.today() + datetime.timedelta(days=14))
+        invoice_subject = st.text_input("Subject / Reference", key="subject", value="Rechnung")
+        
+    with st.expander("Footer & Payment Details", expanded=False):
+        col_bank1, col_bank2 = st.columns(2)
+        with col_bank1:
+            bank_name = st.text_input("Bank Name", key="bank_name")
+            iban = st.text_input("IBAN", key="iban")
+            bic = st.text_input("BIC", key="bic")
+        with col_bank2:
+            contact_email = st.text_input("Contact Email", key="contact_email")
+            contact_phone = st.text_input("Contact Phone", key="contact_phone")
         
     st.subheader("Line Items")
     
     # Load existing items or default
     if "line_items_editor" not in st.session_state or not st.session_state.line_items_editor:
-         st.session_state.line_items_editor = [{"Description": "Consulting Services", "Quantity (hours)": 10.0, "Price per Hour (€)": 150.0, "Total (€)": 1500.0, "Tax 19% (€)": 285.0, "Total incl. Tax (€)": 1785.0}]
+         st.session_state.line_items_editor = [{"Description": "Consulting Services", "Quantity (hours)": 1.0, "Price per Hour (€)": 1.0, "Total (€)": 1.0, "Tax 19% (€)": 0.19, "Total incl. Tax (€)": 1.19}]
 
     if "previous_line_items" not in st.session_state:
         st.session_state.previous_line_items = st.session_state.line_items_editor
@@ -211,10 +227,26 @@ with tab_input:
         # Gather data
         data = {
             "sender": sender_parsed,
+            "sender_tax_id": sender_tax_id,
+            
             "recipient": recipient_parsed,
+            "customer_id": customer_id,
+            
             "items": final_items,
+            
             "id": invoice_id,
-            "date": invoice_date
+            "date": invoice_date,
+            "delivery_date": delivery_date,
+            "due_date": due_date,
+            "subject": invoice_subject,
+            
+            "footer": {
+                "bank_name": bank_name,
+                "iban": iban,
+                "bic": bic,
+                "email": contact_email,
+                "phone": contact_phone
+            }
         }
         
         try:
