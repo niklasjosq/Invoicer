@@ -11,7 +11,7 @@ st.title("ZUGFeRD Invoice Generator")
 # Value defaults
 DEFAULT_SENDER = "My Company GmbH"
 DEFAULT_RECIPIENT = "Client Corp"
-DEFAULT_ITEM = {"Description": "Consulting Services", "Quantity (hours)": 10.0, "Price per Hour (€)": 150.0}
+DEFAULT_ITEM = {"Description": "Consulting Services", "Quantity (hours)": 1.0, "Price per Hour (€)": 1.0}
 
 import json
 
