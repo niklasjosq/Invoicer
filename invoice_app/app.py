@@ -13,6 +13,64 @@ DEFAULT_SENDER = "My Company GmbH"
 DEFAULT_RECIPIENT = "Client Corp"
 DEFAULT_ITEM = {"Description": "Consulting Services", "Quantity (hours)": 10.0, "Price per Hour (€)": 150.0}
 
+import json
+
+# --- History Helper Functions ---
+HISTORY_FILE = "invoice_history.json"
+
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return {"senders": [], "recipients": [], "footers": []}
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            h = json.load(f)
+            if "footers" not in h:
+                h["footers"] = []
+            return h
+    except:
+        return {"senders": [], "recipients": [], "footers": []}
+
+def save_history(history):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=4)
+
+def add_to_history(data):
+    history = load_history()
+    
+    # Process Sender
+    sender_entry = {
+        "name_address": data["sender"].get("name", "") + "\n" + "\n".join(data["sender"].get("address_lines", [])),
+        "tax_id": data.get("sender_tax_id", "")
+    }
+    # Check if exists (simple check by name_address)
+    if sender_entry["name_address"].strip() and not any(s["name_address"] == sender_entry["name_address"] for s in history["senders"]):
+        history["senders"].append(sender_entry)
+        
+    # Process Recipient
+    recipient_entry = {
+        "name_address": data["recipient"].get("name", "") + "\n" + "\n".join(data["recipient"].get("address_lines", [])),
+        "customer_id": data.get("customer_id", "")
+    }
+    if recipient_entry["name_address"].strip() and not any(r["name_address"] == recipient_entry["name_address"] for r in history["recipients"]):
+        history["recipients"].append(recipient_entry)
+        
+    # Process Footer
+    footer_data = data.get("footer", {})
+    footer_entry = {
+        "col1": footer_data.get("col1", ""),
+        "col2": footer_data.get("col2", ""),
+        "col3": footer_data.get("col3", ""),
+        "bank_name": footer_data.get("bank_name", ""),
+        "iban": footer_data.get("iban", ""),
+        "bic": footer_data.get("bic", "")
+    }
+    # Check if footer not empty and unique (check by strings in the 3 columns)
+    if (footer_entry["col1"].strip() or footer_entry["col2"].strip() or footer_entry["col3"].strip()) and \
+        not any(f["col1"] == footer_entry["col1"] and f["col2"] == footer_entry["col2"] and f["col3"] == footer_entry["col3"] for f in history["footers"]):
+        history["footers"].append(footer_entry)
+        
+    save_history(history)
+
 # --- Helper Functions ---
 
 def get_next_invoice_id():
@@ -36,7 +94,10 @@ def save_invoice_counter(count):
 def clear_settings():
     """Resets all session state inputs to defaults."""
     st.session_state.sender_name = ""
+    st.session_state.sender_tax = "" # Fixed key name to match text_input
     st.session_state.recipient_name = ""
+    st.session_state.customer_id = "" # Fixed key name
+    
     st.session_state.invoice_id_manual = get_next_invoice_id()[0] # Reset to next ID
     st.session_state.invoice_date = datetime.date.today()
     st.session_state.line_items_editor = [DEFAULT_ITEM]
@@ -44,6 +105,17 @@ def clear_settings():
     st.session_state.xml_content = None
     st.session_state.pdf_bytes = None
     st.session_state.zugferd_pdf = None
+    st.session_state.qty_label = "Quantity (hours)"
+    st.session_state.price_label = "Price per Hour (€)"
+    st.session_state.unit_code = "HUR"
+    st.session_state.footer_col1 = ""
+    st.session_state.footer_col2 = ""
+    st.session_state.footer_col3 = ""
+    st.session_state.iban = ""
+    st.session_state.bic = ""
+    st.session_state.bank_name = ""
+    st.session_state.contact_email = ""
+    st.session_state.contact_phone = ""
 
 # --- Initialization ---
 
@@ -53,11 +125,18 @@ if "pdf_bytes" not in st.session_state:
     st.session_state.pdf_bytes = None
 if "zugferd_pdf" not in st.session_state:
     st.session_state.zugferd_pdf = None
-
-# Initialize ID if not present
-if "invoice_id_manual" not in st.session_state:
-     next_id, _ = get_next_invoice_id()
-     st.session_state.invoice_id_manual = next_id
+if "qty_label" not in st.session_state:
+    st.session_state.qty_label = "Quantity (hours)"
+if "price_label" not in st.session_state:
+    st.session_state.price_label = "Price per Hour (€)"
+if "unit_code" not in st.session_state:
+    st.session_state.unit_code = "HUR"
+if "footer_col1" not in st.session_state:
+    st.session_state.footer_col1 = ""
+if "footer_col2" not in st.session_state:
+    st.session_state.footer_col2 = ""
+if "footer_col3" not in st.session_state:
+    st.session_state.footer_col3 = ""
 
 # Initialize ID if not present
 if "invoice_id_manual" not in st.session_state:
@@ -70,6 +149,9 @@ tab_input, tab_xml, tab_pdf = st.tabs(["📝 Input Data", "📄 XML Preview", "�
 with tab_input:
     st.header("Input Data")
     
+    # Load History
+    history = load_history()
+    
     # Clear Button
     if st.button("Clear All Settings", type="secondary"):
         clear_settings()
@@ -78,8 +160,46 @@ with tab_input:
     col_details, col_dates = st.columns(2)
     
     with col_details:
+        st.subheader("Sender")
+        # Sender Selection
+        sender_options = ["Select from History..."] + [s["name_address"].split('\n')[0] for s in history.get("senders", [])]
+        
+        def on_sender_change():
+            idx = st.session_state.sender_select_idx
+            if idx > 0:
+                selected = history["senders"][idx-1] # -1 because of "Select..."
+                st.session_state.sender_name = selected["name_address"]
+                st.session_state.sender_tax = selected["tax_id"]
+
+        st.selectbox(
+            "Saved Senders", 
+            options=range(len(sender_options)), 
+            format_func=lambda x: sender_options[x],
+            key="sender_select_idx",
+            on_change=on_sender_change
+        )
+
         sender_data = st.text_area("Sender Details (Name, Address)", height=100, key="sender_name", help="Line 1: Name\nOther lines: Address")
         sender_tax_id = st.text_input("Sender Tax ID / VAT ID (USt-IdNr.)", key="sender_tax")
+        
+        st.subheader("Recipient")
+        # Recipient Selection
+        recipient_options = ["Select from History..."] + [r["name_address"].split('\n')[0] for r in history.get("recipients", [])]
+        
+        def on_recipient_change():
+            idx = st.session_state.recipient_select_idx
+            if idx > 0:
+                selected = history["recipients"][idx-1]
+                st.session_state.recipient_name = selected["name_address"]
+                st.session_state.customer_id = selected["customer_id"]
+
+        st.selectbox(
+            "Saved Recipients", 
+            options=range(len(recipient_options)), 
+            format_func=lambda x: recipient_options[x],
+            key="recipient_select_idx",
+            on_change=on_recipient_change
+        )
         
         recipient_data = st.text_area("Recipient Details (Name, Address)", height=100, key="recipient_name", help="Line 1: Name\nOther lines: Address")
         customer_id = st.text_input("Customer ID (Kundennummer)", key="customer_id")
@@ -87,19 +207,74 @@ with tab_input:
     with col_dates:
         invoice_id = st.text_input("Invoice Number", key="invoice_id_manual")
         invoice_date = st.date_input("Invoice Date", key="invoice_date", value=datetime.date.today())
-        delivery_date = st.date_input("Service Date (Leistungsdatum)", key="delivery_date", value=datetime.date.today())
+        delivery_date = st.date_input("Service Date/Period (Leistungszeitraum)", key="delivery_date", value=(datetime.date.today(), datetime.date.today()))
         due_date = st.date_input("Due Date (Zahlungsziel)", key="due_date", value=datetime.date.today() + datetime.timedelta(days=14))
         invoice_subject = st.text_input("Subject / Reference", key="subject", value="Rechnung")
         
     with st.expander("Footer & Payment Details", expanded=False):
-        col_bank1, col_bank2 = st.columns(2)
-        with col_bank1:
-            bank_name = st.text_input("Bank Name", key="bank_name")
-            iban = st.text_input("IBAN", key="iban")
-            bic = st.text_input("BIC", key="bic")
-        with col_bank2:
-            contact_email = st.text_input("Contact Email", key="contact_email")
-            contact_phone = st.text_input("Contact Phone", key="contact_phone")
+        # Footer Selection
+        footer_options = ["Select from History..."] + [f"Footer Config {i+1}" for i in range(len(history.get("footers", [])))]
+        
+        def on_footer_change():
+            idx = st.session_state.footer_select_idx
+            if idx > 0:
+                selected = history["footers"][idx-1]
+                st.session_state.footer_col1 = selected["col1"]
+                st.session_state.footer_col2 = selected["col2"]
+                st.session_state.footer_col3 = selected["col3"]
+                st.session_state.bank_name = selected["bank_name"]
+                st.session_state.iban = selected["iban"]
+                st.session_state.bic = selected["bic"]
+
+        st.selectbox(
+            "Saved Footers", 
+            options=range(len(footer_options)), 
+            format_func=lambda x: footer_options[x],
+            key="footer_select_idx",
+            on_change=on_footer_change
+        )
+        
+        st.info("Write free text for the 3 columns in the PDF footer. Use the optional fields below if you need structured bank details for the ZUGFeRD XML.")
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            st.text_area("Footer Column 1 (Left)", key="footer_col1", height=150, help="Typically: Sender Name, Address, Tax ID")
+        with col_f2:
+            st.text_area("Footer Column 2 (Middle)", key="footer_col2", height=150, help="Typically: Bank Name, IBAN, BIC")
+        with col_f3:
+            st.text_area("Footer Column 3 (Right)", key="footer_col3", height=150, help="Typically: Contact Email, Phone, Website")
+            
+        st.divider()
+        st.subheader("Optional: XML Bank Details (Structured)")
+        col_xml1, col_xml2, col_xml3 = st.columns(3)
+        with col_xml1:
+             st.text_input("Bank Name (XML)", key="bank_name")
+        with col_xml2:
+             st.text_input("IBAN (XML)", key="iban")
+        with col_xml3:
+             st.text_input("BIC (XML)", key="bic")
+            
+    with st.expander("⚙️ Columns & Units", expanded=False):
+        col_c1, col_c2, col_c3 = st.columns(3)
+        with col_c1:
+            st.text_input("Quantity Label", key="qty_label")
+        with col_c2:
+            st.text_input("Price Label", key="price_label")
+        with col_c3:
+            unit_options = {
+                "HUR": "Hour (HUR)",
+                "DAY": "Day (DAY)",
+                "H87": "Piece (H87)",
+                "C62": "Unit (C62)", 
+                "LS": "Flat Rate (LS)",
+                "KMT": "Kilometer (KMT)"
+            }
+            # Helper to find key by value or default
+            st.selectbox(
+                "Unit of Measure",
+                options=list(unit_options.keys()),
+                format_func=lambda x: unit_options[x],
+                key="unit_code"
+            )
         
     st.subheader("Line Items")
     
@@ -117,11 +292,11 @@ with tab_input:
         key="line_items_editor_widget",
         use_container_width=True,
         column_config={
-            "Quantity (hours)": st.column_config.NumberColumn(min_value=0, step=0.1, format="%.2f"),
-            "Price per Hour (€)": st.column_config.NumberColumn(min_value=0, step=0.01, format="%.2f €"),
-            "Total (€)": st.column_config.NumberColumn(format="%.2f €"), # Editable
-            "Tax 19% (€)": st.column_config.NumberColumn(format="%.2f €"), # Editable
-            "Total incl. Tax (€)": st.column_config.NumberColumn(format="%.2f €", disabled=True), # Gross still calculated for convenience or allow edit? Let's keep strict for now.
+            "Quantity (hours)": st.column_config.NumberColumn(label=st.session_state.qty_label, min_value=0, step=0.1, format="%.2f"),
+            "Price per Hour (€)": st.column_config.NumberColumn(label=st.session_state.price_label, min_value=0, step=0.01, format="%.2f"),
+            "Total (€)": st.column_config.NumberColumn(format="%.2f"), # Editable
+            "Tax 19% (€)": st.column_config.NumberColumn(format="%.2f"), # Editable
+            "Total incl. Tax (€)": st.column_config.NumberColumn(format="%.2f", disabled=True), # Gross still calculated for convenience or allow edit? Let's keep strict for now.
         }
     )
 
@@ -241,12 +416,15 @@ with tab_input:
             "subject": invoice_subject,
             
             "footer": {
-                "bank_name": bank_name,
-                "iban": iban,
-                "bic": bic,
-                "email": contact_email,
-                "phone": contact_phone
-            }
+                "col1": st.session_state.footer_col1,
+                "col2": st.session_state.footer_col2,
+                "col3": st.session_state.footer_col3,
+                "bank_name": st.session_state.bank_name,
+                "iban": st.session_state.iban,
+                "bic": st.session_state.bic
+            },
+            
+            "unit_code": st.session_state.unit_code
         }
         
         try:
@@ -258,6 +436,9 @@ with tab_input:
             
             # Combine
             st.session_state.zugferd_pdf = create_zugferd_pdf(st.session_state.pdf_bytes, st.session_state.xml_content)
+            
+            # Save to History
+            add_to_history(data)
             
             st.success("Invoice Generated! Check the Preview tabs.")
             

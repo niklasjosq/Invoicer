@@ -10,3 +10,9 @@ __pycache__/
 
 # MacOS
 .DS_Store
+invoice_history.json
+
+# Personal debug/test scripts
+debug_xml.py
+debug_xml_header.py
+test_full_fields.py

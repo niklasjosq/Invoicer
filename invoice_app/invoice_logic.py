@@ -12,6 +12,21 @@ from drafthorse.models.note import IncludedNote
 if hasattr(Header, "_fields"):
     Header._fields = [f for f in Header._fields if f.name != "Name"]
 
+def format_de(value):
+    """
+    Formats a float to German style: 1.250,00
+    """
+    if value is None:
+        return "0,00"
+    try:
+        # Format with 2 decimals and comma as decimal, dot as thousands
+        # Manual replacement to avoid locale issues
+        s = f"{float(value):,.2f}"
+        # Swap US format (,) to temp, US (.) to (,), temp to (.)
+        return s.replace(",", "TEMP").replace(".", ",").replace("TEMP", ".")
+    except (ValueError, TypeError):
+        return "0,00"
+
 def generate_invoice_xml(data):
     """
     Generates ZUGFeRD XML from the provided data dictionary.
@@ -51,7 +66,12 @@ def generate_invoice_xml(data):
     
     # Delivery / Service Date
     if data.get("delivery_date"):
-        doc.trade.delivery.event.occurrence = data.get("delivery_date")
+        dd = data.get("delivery_date")
+        if isinstance(dd, (list, tuple)) and len(dd) >= 1:
+            # Handle single date in range widget or full range
+            doc.trade.delivery.event.occurrence = dd[0] # Using start date for occurrence
+        else:
+            doc.trade.delivery.event.occurrence = dd
         
     # Payment Terms / Due Date
     if data.get("due_date"):
@@ -103,7 +123,7 @@ def generate_invoice_xml(data):
             
         tax_percent = 19.0 # We still claiming it's 19% VAT standard
         
-        li.delivery.billed_quantity = (qty, "HUR") # HUR for Hours
+        li.delivery.billed_quantity = (qty, data.get("unit_code", "HUR")) 
         li.agreement.net.amount = price
         li.settlement.monetary_summation.total_amount = net_line
         
@@ -160,10 +180,18 @@ def generate_invoice_pdf(data):
     pdf.cell(0, 6, f"Datum: {data.get('date', datetime.date.today()).strftime('%d.%m.%Y')}", new_x="LMARGIN", new_y="NEXT")
     
     if data.get("customer_id"):
-        pdf.cell(0, 6, f"Mieternr./Kd.-Nr.: {data.get('customer_id')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 6, f"Kundennummer: {data.get('customer_id')}", new_x="LMARGIN", new_y="NEXT")
 
     if data.get("delivery_date"):
-        pdf.cell(0, 6, f"Leistungsdatum: {data.get('delivery_date').strftime('%d.%m.%Y')}", new_x="LMARGIN", new_y="NEXT")
+        dd = data.get("delivery_date")
+        if isinstance(dd, (list, tuple)) and len(dd) == 2:
+            start_str = dd[0].strftime('%d.%m.%Y')
+            end_str = dd[1].strftime('%d.%m.%Y')
+            pdf.cell(0, 6, f"Leistungszeitraum: {start_str} - {end_str}", new_x="LMARGIN", new_y="NEXT")
+        elif isinstance(dd, (list, tuple)) and len(dd) == 1:
+            pdf.cell(0, 6, f"Leistungsdatum: {dd[0].strftime('%d.%m.%Y')}", new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.cell(0, 6, f"Leistungsdatum: {dd.strftime('%d.%m.%Y')}", new_x="LMARGIN", new_y="NEXT")
         
     pdf.ln(5)
     
@@ -235,10 +263,10 @@ def generate_invoice_pdf(data):
         total_tax_accumulated += tax_line
         
         pdf.cell(70, 8, desc, border=1)
-        pdf.cell(30, 8, f"{qty:.2f}", border=1, align="R")
-        pdf.cell(35, 8, f"{price:.2f}", border=1, align="R")
-        pdf.cell(30, 8, f"{net_line:.2f}", border=1, align="R")
-        pdf.cell(25, 8, f"{total_incl:.2f}", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(30, 8, format_de(qty), border=1, align="R")
+        pdf.cell(35, 8, format_de(price), border=1, align="R")
+        pdf.cell(30, 8, format_de(net_line), border=1, align="R")
+        pdf.cell(25, 8, format_de(total_incl), border=1, align="R", new_x="LMARGIN", new_y="NEXT")
         
     # Total
     total_gross = total_net + total_tax_accumulated
@@ -246,13 +274,13 @@ def generate_invoice_pdf(data):
     pdf.ln(5)
     pdf.set_font("Helvetica", style="B", size=10)
     pdf.cell(135, 8, "Summe Netto:", align="R")
-    pdf.cell(55, 8, f"{total_net:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(55, 8, f"{format_de(total_net)} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
     pdf.cell(135, 8, "MwSt 19%:", align="R")
-    pdf.cell(55, 8, f"{total_tax_accumulated:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(55, 8, f"{format_de(total_tax_accumulated)} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
     pdf.cell(135, 8, "Gesamtbetrag:", align="R")
-    pdf.cell(55, 8, f"{total_gross:.2f} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(55, 8, f"{format_de(total_gross)} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
     # Payment Terms logic
     pdf.ln(10)
@@ -269,17 +297,17 @@ def generate_invoice_pdf(data):
     # We use manual positioning for footer columns to be clean
     base_y = pdf.get_y()
     
-    # Col 1: Seller Name & Tax
+    # Col 1
     pdf.set_xy(pdf.l_margin, base_y)
-    pdf.multi_cell(50, 4, f"{data['sender'].get('name', '')}\nSt.-Nr/USt-ID: {data.get('sender_tax_id', '')}")
+    pdf.multi_cell(50, 4, footer.get("col1", ""))
     
-    # Col 2: Bank
+    # Col 2
     pdf.set_xy(pdf.l_margin + 60, base_y)
-    pdf.multi_cell(60, 4, f"Bank: {footer.get('bank_name', '')}\nIBAN: {footer.get('iban', '')}\nBIC: {footer.get('bic', '')}")
+    pdf.multi_cell(60, 4, footer.get("col2", ""))
     
-    # Col 3: Contact
+    # Col 3
     pdf.set_xy(pdf.l_margin + 130, base_y)
-    pdf.multi_cell(50, 4, f"Kontakt:\n{footer.get('email', '')}\n{footer.get('phone', '')}")
+    pdf.multi_cell(50, 4, footer.get("col3", ""))
 
     return bytes(pdf.output())
 
