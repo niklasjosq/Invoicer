@@ -27,11 +27,29 @@ def format_de(value):
     except (ValueError, TypeError):
         return "0,00"
 
+def get_tax_scheme(tax_id):
+    """
+    Determines if the tax ID is a VAT ID (VA) or a local fiscal number (FC).
+    Sanitizes the input by removing spaces.
+    """
+    if not tax_id:
+        return None, None
+        
+    clean_id = tax_id.replace(" ", "").strip()
+    
+    # Simple heuristic: VAT IDs usually start with 2 letters (country code)
+    # e.g. DE123456789
+    if len(clean_id) > 2 and clean_id[:2].isalpha():
+        return clean_id, "VA"
+    else:
+        return clean_id, "FC"
+
 def generate_invoice_xml(data):
     """
     Generates ZUGFeRD XML from the provided data dictionary.
     """
     doc = Document()
+    # Use standard ZUGFeRD 2.3 / EN16931 ID
     doc.context.guideline_parameter.id = "urn:cen.eu:en16931:2017#compliant#urn:factur-x.eu:1p0:en16931"
     
     # Header
@@ -50,10 +68,12 @@ def generate_invoice_xml(data):
     doc.trade.agreement.seller.address.country_id = "DE" # Defaulting to DE fow now
     
     if data.get("sender_tax_id"):
-        tr = TaxRegistration()
-        tr.id = data.get("sender_tax_id")
-        tr.id._scheme_id = "VA" # VAT ID scheme - Accessing internal as drafthorse element doesn't expose setter
-        doc.trade.agreement.seller.tax_registrations.add(tr)
+        tid, scheme = get_tax_scheme(data.get("sender_tax_id"))
+        if tid:
+            tr = TaxRegistration()
+            tr.id = tid
+            tr.id._scheme_id = scheme 
+            doc.trade.agreement.seller.tax_registrations.add(tr)
 
     doc.trade.agreement.buyer.name = data["recipient"].get("name", "Unknown Buyer")
     doc.trade.agreement.buyer.id = data.get("customer_id") # Customer ID
@@ -104,7 +124,7 @@ def generate_invoice_xml(data):
     for item in data.get("items", []):
         li = LineItem()
         li.document.line_id = str(len(doc.trade.items.children) + 1)
-        li.product.name = item.get("Description", "Item")
+        li.product.name = item.get("Description") or "Item"
         
         # New keys from UI
         # We respect the Total provided by the UI (which handles calculation/manual override)
@@ -156,26 +176,97 @@ def generate_invoice_xml(data):
     tax.rate_applicable_percent = 19.0 # Placeholder
     doc.trade.settlement.trade_tax.add(tax)
 
-    return doc.serialize(schema="FACTUR-X_EN16931").decode("utf-8")
+    # Serialize to XML string
+    xml_str = doc.serialize(schema="FACTUR-X_EN16931").decode("utf-8")
+    
+    # Post-process XML to inject schemeID for Buyer ID (drafthorse doesn't support it on StringField)
+    try:
+        import xml.etree.ElementTree as ET
+        
+        # Register namespaces to prevent ns0 prefixes
+        namespaces = {
+            "rsm": "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100",
+            "ram": "urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100",
+            "udt": "urn:un:unece:uncefact:data:standard:UnqualifiedDataType:100",
+            "qdt": "urn:un:unece:uncefact:data:standard:QualifiedDataType:100",
+        }
+        for prefix, uri in namespaces.items():
+            ET.register_namespace(prefix, uri)
+            
+        root = ET.fromstring(xml_str)
+        
+        # Find Buyer ID
+        # XPath: rsm:SupplyChainTradeTransaction/ram:ApplicableHeaderTradeAgreement/ram:BuyerTradeParty/ram:ID
+        buyer_id = root.find(".//ram:BuyerTradeParty/ram:ID", namespaces)
+        
+        if buyer_id is not None and buyer_id.text:
+            # Set schemeID="91" (Seller assigned)
+            buyer_id.set("schemeID", "91")
+            
+        xml_str = ET.tostring(root, encoding="utf-8").decode("utf-8")
+        
+        # Add XML declaration if missing (ET.tostring might omit it or add it differently)
+        if not xml_str.startswith("<?xml"):
+            xml_str = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_str
+            
+    except Exception as e:
+        print(f"Error post-processing XML: {e}")
+        # Fallback to original if hack fails
+        pass
+
+    return xml_str
 
 from fpdf import FPDF
+from fpdf.output import PDFICCProfile
+from fpdf.enums import OutputIntentSubType
 from drafthorse.pdf import attach_xml
+import os
 
 def generate_invoice_pdf(data):
     """
     Generates visual PDF using fpdf2.
     """
     pdf = FPDF()
+    
+    # Add Fonts (Arial)
+    # Ensure assets exist
+    assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+    arial_path = os.path.join(assets_dir, "Arial.ttf")
+    arial_bold_path = os.path.join(assets_dir, "Arial_Bold.ttf")
+    
+    if os.path.exists(arial_path):
+        pdf.add_font("Arial", style="", fname=arial_path)
+    if os.path.exists(arial_bold_path):
+        pdf.add_font("Arial", style="B", fname=arial_bold_path)
+        
     pdf.add_page()
-    pdf.set_font("Helvetica", size=12)
+    
+    # Add ICC Profile for PDF/A-3 Compliance (resolves DeviceGray error)
+    icc_path = os.path.join(assets_dir, "sRGB.icc")
+    if os.path.exists(icc_path):
+        with open(icc_path, "rb") as f:
+            icc_bytes = f.read()
+        # n=3 for RGB
+        profile = PDFICCProfile(icc_bytes, 3, "DeviceRGB")
+        pdf.add_output_intent(
+            subtype=OutputIntentSubType.PDFA, 
+            output_condition_identifier="sRGB IEC61966-2.1", 
+            dest_output_profile=profile,
+            info="sRGB IEC61966-2.1"
+        )
+        
+    # Use Arial if available, else fallback to Helvetica (though internal Helvetica is not embedded)
+    font_family = "Arial" if os.path.exists(arial_path) else "Helvetica"
+    
+    pdf.set_font(font_family, size=12)
     
     # Title
-    pdf.set_font("Helvetica", style="B", size=20)
+    pdf.set_font(font_family, style="B", size=20)
     pdf.cell(0, 10, "RECHNUNG", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(10)
     
     # Details
-    pdf.set_font("Helvetica", size=12)
+    pdf.set_font(font_family, size=12)
     pdf.cell(0, 6, f"Rechnungsnummer: {data.get('id', 'INV-001')}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 6, f"Datum: {data.get('date', datetime.date.today()).strftime('%d.%m.%Y')}", new_x="LMARGIN", new_y="NEXT")
     
@@ -198,11 +289,11 @@ def generate_invoice_pdf(data):
     # Sender and Recipient
     col_width = pdf.epw / 2
     
-    pdf.set_font("Helvetica", style="B", size=11)
+    pdf.set_font(font_family, style="B", size=11)
     pdf.cell(col_width, 6, "Absender:", border=0)
     pdf.cell(col_width, 6, "Empfänger:", border=0, new_x="LMARGIN", new_y="NEXT")
     
-    pdf.set_font("Helvetica", size=11)
+    pdf.set_font(font_family, size=11)
     
     # Construct full address strings
     sender_lines = [data["sender"].get("name", "")] + data["sender"].get("address_lines", [])
@@ -228,12 +319,12 @@ def generate_invoice_pdf(data):
     
     # Subject
     if data.get("subject"):
-        pdf.set_font("Helvetica", style="B", size=12)
+        pdf.set_font(font_family, style="B", size=12)
         pdf.cell(0, 8, data.get("subject"), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
     
     # Table Header
-    pdf.set_font("Helvetica", style="B", size=10)
+    pdf.set_font(font_family, style="B", size=10)
     pdf.cell(70, 8, "Beschreibung", border=1)
     pdf.cell(30, 8, "Menge", border=1, align="R")
     pdf.cell(35, 8, "Preis/Einheit", border=1, align="R")
@@ -241,7 +332,7 @@ def generate_invoice_pdf(data):
     pdf.cell(25, 8, "Gesamt", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
     # Table Rows
-    pdf.set_font("Helvetica", size=10)
+    pdf.set_font(font_family, size=10)
     total_net = 0.0
     total_tax_accumulated = 0.0
     
@@ -272,7 +363,7 @@ def generate_invoice_pdf(data):
     total_gross = total_net + total_tax_accumulated
     
     pdf.ln(5)
-    pdf.set_font("Helvetica", style="B", size=10)
+    pdf.set_font(font_family, style="B", size=10)
     pdf.cell(135, 8, "Summe Netto:", align="R")
     pdf.cell(55, 8, f"{format_de(total_net)} EUR", border=1, align="R", new_x="LMARGIN", new_y="NEXT")
     
@@ -284,13 +375,13 @@ def generate_invoice_pdf(data):
     
     # Payment Terms logic
     pdf.ln(10)
-    pdf.set_font("Helvetica", size=10)
+    pdf.set_font(font_family, size=10)
     if data.get("due_date"):
         pdf.cell(0, 5, f"Zahlbar ohne Abzug bis zum {data.get('due_date').strftime('%d.%m.%Y')}.", new_x="LMARGIN", new_y="NEXT")
 
     # Footer
     pdf.set_y(-40)
-    pdf.set_font("Helvetica", size=8)
+    pdf.set_font(font_family, size=8)
     footer = data.get("footer", {})
     
     # Footer Columns

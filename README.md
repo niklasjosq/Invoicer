@@ -2,6 +2,9 @@
 
 A Python Streamlit application that generates ZUGFeRD (EN 16931) compliant electronic invoices. This tool allows you to input invoice details, generates the required XML structure, creates a visual PDF, and embeds the XML into the PDF to create a valid PDF/A-3 ZUGFeRD invoice.
 
+PDF and XML validator:
+https://www.xrechnungs.de/xrechnung-validator-online
+
 ## Features
 
 - **Tabbed Interface**: Organized into "Input Data", "XML Preview", and "PDF Preview" tabs.
