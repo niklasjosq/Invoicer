@@ -1,16 +1,16 @@
 import datetime
-from drafthorse.models.document import Document, Header
-from drafthorse.models.trade import TradeTransaction
-from drafthorse.models.tradelines import LineItem
-from drafthorse.models.party import SellerTradeParty, BuyerTradeParty, TaxRegistration
-from drafthorse.models.payment import PaymentTerms, PaymentMeans, PayeeFinancialAccount, PayeeFinancialInstitution
-from drafthorse.models.accounting import ApplicableTradeTax
-from drafthorse.models.note import IncludedNote
+import xml.etree.ElementTree as ET
 
-# Monkey Patch: Remove 'Name' from Header fields as it causes validation error in EN16931 profile
-# Drafthorse defines it as required, but ZUGFeRD schema order/presence rules reject it.
-if hasattr(Header, "_fields"):
-    Header._fields = [f for f in Header._fields if f.name != "Name"]
+# Register namespaces to ensure correct prefixes in output
+NAMESPACES = {
+    "rsm": "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100",
+    "ram": "urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100",
+    "udt": "urn:un:unece:uncefact:data:standard:UnqualifiedDataType:100",
+    "qdt": "urn:un:unece:uncefact:data:standard:QualifiedDataType:100",
+}
+
+for prefix, uri in NAMESPACES.items():
+    ET.register_namespace(prefix, uri)
 
 def format_de(value):
     """
@@ -19,10 +19,7 @@ def format_de(value):
     if value is None:
         return "0,00"
     try:
-        # Format with 2 decimals and comma as decimal, dot as thousands
-        # Manual replacement to avoid locale issues
         s = f"{float(value):,.2f}"
-        # Swap US format (,) to temp, US (.) to (,), temp to (.)
         return s.replace(",", "TEMP").replace(".", ",").replace("TEMP", ".")
     except (ValueError, TypeError):
         return "0,00"
@@ -34,186 +31,280 @@ def get_tax_scheme(tax_id):
     """
     if not tax_id:
         return None, None
-        
     clean_id = tax_id.replace(" ", "").strip()
-    
     # Simple heuristic: VAT IDs usually start with 2 letters (country code)
-    # e.g. DE123456789
     if len(clean_id) > 2 and clean_id[:2].isalpha():
         return clean_id, "VA"
     else:
         return clean_id, "FC"
 
-def generate_invoice_xml(data):
+def parse_address_fields(lines):
     """
-    Generates ZUGFeRD XML from the provided data dictionary.
+    Attempts to extract CityName and PostcodeCode from address lines.
+    Assumes last line is 'Zip City' or 'City Zip' or similar.
     """
-    doc = Document()
-    # Use standard ZUGFeRD 2.3 / EN16931 ID
-    doc.context.guideline_parameter.id = "urn:cen.eu:en16931:2017#compliant#urn:factur-x.eu:1p0:en16931"
+    postcode = ""
+    city = ""
+    line_one = lines[0] if len(lines) > 0 else ""
     
-    # Header
-    doc.header.id = data.get("id", "INV-001")
-    # doc.header.name = "RECHNUNG" # Not allowed in EN16931
-    doc.header.type_code = "380" # Commercial Invoice
-    doc.header.issue_date_time = data.get("date", datetime.date.today())
-    
-    # Trade Agreement
-    doc.trade.agreement.seller.name = data["sender"].get("name", "Unknown Seller")
-    # Map address lines to ZUGFeRD structure (simplified: just lines 1-3)
-    seller_addr = data["sender"].get("address_lines", [])
-    if len(seller_addr) > 0: doc.trade.agreement.seller.address.line_one = seller_addr[0]
-    if len(seller_addr) > 1: doc.trade.agreement.seller.address.line_two = seller_addr[1]
-    if len(seller_addr) > 2: doc.trade.agreement.seller.address.line_three = seller_addr[2]
-    doc.trade.agreement.seller.address.country_id = "DE" # Defaulting to DE fow now
-    
-    if data.get("sender_tax_id"):
-        tid, scheme = get_tax_scheme(data.get("sender_tax_id"))
-        if tid:
-            tr = TaxRegistration()
-            tr.id = tid
-            tr.id._scheme_id = scheme 
-            doc.trade.agreement.seller.tax_registrations.add(tr)
-
-    doc.trade.agreement.buyer.name = data["recipient"].get("name", "Unknown Buyer")
-    doc.trade.agreement.buyer.id = data.get("customer_id") # Customer ID
-    
-    buyer_addr = data["recipient"].get("address_lines", [])
-    if len(buyer_addr) > 0: doc.trade.agreement.buyer.address.line_one = buyer_addr[0]
-    if len(buyer_addr) > 1: doc.trade.agreement.buyer.address.line_two = buyer_addr[1]
-    if len(buyer_addr) > 2: doc.trade.agreement.buyer.address.line_three = buyer_addr[2]
-    doc.trade.agreement.buyer.address.country_id = "DE" 
-    
-    # Delivery / Service Date
-    if data.get("delivery_date"):
-        dd = data.get("delivery_date")
-        if isinstance(dd, (list, tuple)) and len(dd) >= 1:
-            # Handle single date in range widget or full range
-            doc.trade.delivery.event.occurrence = dd[0] # Using start date for occurrence
+    if len(lines) > 1:
+        # Try to parse the last line
+        last_line = lines[-1].strip()
+        parts = last_line.split(" ", 1)
+        if len(parts) == 2:
+            # Check if one part is numeric (Zip)
+            if parts[0].isdigit():
+                postcode = parts[0]
+                city = parts[1]
+            elif parts[1].isdigit():
+                city = parts[0]
+                postcode = parts[1]
+            else:
+                # Fallback: assume first part is city if no digit
+                city = parts[0]
+                postcode = parts[1]
         else:
-            doc.trade.delivery.event.occurrence = dd
-        
-    # Payment Terms / Due Date
-    if data.get("due_date"):
-        terms = PaymentTerms()
-        terms.due = data.get("due_date")
-        terms.description = f"Zahlbar bis zum {data.get('due_date').strftime('%d.%m.%Y')}"
-        doc.trade.settlement.terms.add(terms)
+            city = last_line
+            
+    return line_one, postcode, city
+
+def generate_facturx_xml(data):
+    """
+    Generates strict Factur-X Basic Profile XML using ElementTree.
+    Includes mandatory fields for XRechnung validation.
+    """
+    # 1. Root Element
+    root = ET.Element(f"{{{NAMESPACES['rsm']}}}CrossIndustryInvoice")
     
-    # Bank Details
-    footer = data.get("footer", {})
-    if footer.get("iban"):
-        pm = PaymentMeans()
-        pm.type_code = "58" # SEPA Credit Transfer
-        
-        pm.payee_account.iban = footer.get("iban")
-        pm.payee_institution.bic = footer.get("bic")
-        
-        doc.trade.settlement.payment_means.add(pm)
+    # 2. ExchangedDocumentContext
+    context = ET.SubElement(root, f"{{{NAMESPACES['rsm']}}}ExchangedDocumentContext")
+    guideline = ET.SubElement(context, f"{{{NAMESPACES['ram']}}}GuidelineSpecifiedDocumentContextParameter")
+    guideline_id = ET.SubElement(guideline, f"{{{NAMESPACES['ram']}}}ID")
+    guideline_id.text = "urn:cen.eu:en16931:2017#compliant#urn:factur-x.eu:1p0:basic"
     
-    # Note / Subject
-    if data.get("subject"):
-        note = IncludedNote()
-        note.content = data.get("subject")
-        doc.header.notes.add(note)
+    # 3. ExchangedDocument
+    ex_doc = ET.SubElement(root, f"{{{NAMESPACES['rsm']}}}ExchangedDocument")
+    doc_id = ET.SubElement(ex_doc, f"{{{NAMESPACES['ram']}}}ID")
+    doc_id.text = data.get("id", "INV-001")
     
-    # Items and Totals
+    doc_type = ET.SubElement(ex_doc, f"{{{NAMESPACES['ram']}}}TypeCode")
+    doc_type.text = "380" # Commercial Invoice
+    
+    issue_date = ET.SubElement(ex_doc, f"{{{NAMESPACES['ram']}}}IssueDateTime")
+    dt_str = ET.SubElement(issue_date, f"{{{NAMESPACES['udt']}}}DateTimeString", {"format": "102"})
+    dt_str.text = data.get("date", datetime.date.today()).strftime("%Y%m%d")
+    
+    # 4. SupplyChainTradeTransaction
+    transaction = ET.SubElement(root, f"{{{NAMESPACES['rsm']}}}SupplyChainTradeTransaction")
+    
+    # -- Line Items
+    items = data.get("items", [])
     total_net = 0.0
     total_tax = 0.0
     
-    for item in data.get("items", []):
-        li = LineItem()
-        li.document.line_id = str(len(doc.trade.items.children) + 1)
-        li.product.name = item.get("Description") or "Item"
+    for idx, item in enumerate(items, 1):
+        line_item = ET.SubElement(transaction, f"{{{NAMESPACES['ram']}}}IncludedSupplyChainTradeLineItem")
         
-        # New keys from UI
-        # We respect the Total provided by the UI (which handles calculation/manual override)
-        net_line = float(item.get("Total (€)", 0) or 0)
-        # Fallback if Total is 0 but Qty/Price exist (though UI handles this)
-        qty = float(item.get("Quantity (hours)", 0) or 0)
-        price = float(item.get("Price per Hour (€)", 0) or 0)
-        if net_line == 0 and (qty * price) != 0:
-             net_line = qty * price
-             
-        tax_amount = float(item.get("Tax 19% (€)", 0) or 0)  
+        # AssociatedDocumentLineDocument
+        line_doc = ET.SubElement(line_item, f"{{{NAMESPACES['ram']}}}AssociatedDocumentLineDocument")
+        line_id = ET.SubElement(line_doc, f"{{{NAMESPACES['ram']}}}LineID")
+        line_id.text = str(idx)
         
-        # Let's use the UI's values for totals
-        if tax_amount == 0 and net_line != 0:
-            tax_amount = net_line * 0.19
+        # SpecifiedTradeProduct
+        product = ET.SubElement(line_item, f"{{{NAMESPACES['ram']}}}SpecifiedTradeProduct")
+        
+        # BT-29: Global ID (optional) - Only generate if scheme is provided
+        if item.get("global_id") and item.get("global_id_scheme"):
+            g_id = ET.SubElement(product, f"{{{NAMESPACES['ram']}}}GlobalID", {"schemeID": item["global_id_scheme"]})
+            g_id.text = item["global_id"]
             
-        tax_percent = 19.0 # We still claiming it's 19% VAT standard
+        name = ET.SubElement(product, f"{{{NAMESPACES['ram']}}}Name")
+        name.text = item.get("name", item.get("Description", "Item"))
         
-        li.delivery.billed_quantity = (qty, data.get("unit_code", "HUR")) 
-        li.agreement.net.amount = price
-        li.settlement.monetary_summation.total_amount = net_line
+        # SpecifiedLineTradeAgreement
+        agreement = ET.SubElement(line_item, f"{{{NAMESPACES['ram']}}}SpecifiedLineTradeAgreement")
+        price_node = ET.SubElement(agreement, f"{{{NAMESPACES['ram']}}}NetPriceProductTradePrice")
+        charge = ET.SubElement(price_node, f"{{{NAMESPACES['ram']}}}ChargeAmount")
+        unit_price = float(item.get("price", item.get("Price per Hour (€)", 0)))
+        charge.text = f"{unit_price:.2f}"
         
-        # Add tax details to line (single field in drafthorse LineSettlement)
-        li.settlement.trade_tax.type_code = "VAT"
-        li.settlement.trade_tax.category_code = "S" # Standard rate
-        li.settlement.trade_tax.rate_applicable_percent = tax_percent
+        # SpecifiedLineTradeDelivery
+        delivery_line = ET.SubElement(line_item, f"{{{NAMESPACES['ram']}}}SpecifiedLineTradeDelivery")
+        qty = ET.SubElement(delivery_line, f"{{{NAMESPACES['ram']}}}BilledQuantity", {"unitCode": data.get("unit_code", "HUR")})
+        qty_val = float(item.get("qty", item.get("Quantity (hours)", 0)))
+        qty.text = f"{qty_val:.2f}"
         
-        doc.trade.items.add(li)
+        # SpecifiedLineTradeSettlement
+        settlement_line = ET.SubElement(line_item, f"{{{NAMESPACES['ram']}}}SpecifiedLineTradeSettlement")
+        
+        tax_percent = float(item.get("vat_percent", 19.0))
+        tax_line = ET.SubElement(settlement_line, f"{{{NAMESPACES['ram']}}}ApplicableTradeTax")
+        
+        # Line level tax for Basic profile should ONLY have: TypeCode, CategoryCode, RateApplicablePercent
+        t_line_type = ET.SubElement(tax_line, f"{{{NAMESPACES['ram']}}}TypeCode")
+        t_line_type.text = "VAT"
+        t_line_cat = ET.SubElement(tax_line, f"{{{NAMESPACES['ram']}}}CategoryCode")
+        t_line_cat.text = "S"
+        t_line_rate = ET.SubElement(tax_line, f"{{{NAMESPACES['ram']}}}RateApplicablePercent")
+        t_line_rate.text = f"{tax_percent:.2f}"
+        
+        line_summation = ET.SubElement(settlement_line, f"{{{NAMESPACES['ram']}}}SpecifiedTradeSettlementLineMonetarySummation")
+        net_line = round(unit_price * qty_val, 2)
+        l_total_amt = ET.SubElement(line_summation, f"{{{NAMESPACES['ram']}}}LineTotalAmount", {"currencyID": "EUR"})
+        l_total_amt.text = f"{net_line:.2f}"
         
         total_net += net_line
-        total_tax += tax_amount
-
-    # Totals
-    doc.trade.settlement.monetary_summation.line_total = total_net
-    doc.trade.settlement.monetary_summation.charge_total = 0.0
-    doc.trade.settlement.monetary_summation.allowance_total = 0.0
-    doc.trade.settlement.monetary_summation.tax_basis_total = total_net
-    doc.trade.settlement.monetary_summation.tax_total = (total_tax, "EUR")
-    doc.trade.settlement.monetary_summation.grand_total = (total_net + total_tax, "EUR")
-    doc.trade.settlement.monetary_summation.due_amount = total_net + total_tax
-    doc.trade.settlement.currency_code = "EUR"
+        total_tax += round(net_line * (tax_percent / 100.0), 2)
+        
+    # -- Header Trade Agreement
+    header_agreement = ET.SubElement(transaction, f"{{{NAMESPACES['ram']}}}ApplicableHeaderTradeAgreement")
     
-    # Add a tax breakdown (container)
-    tax = ApplicableTradeTax()
-    tax.type_code = "VAT"
-    tax.category_code = "S"
-    tax.basis_amount = total_net
-    tax.calculated_amount = total_tax
-    tax.rate_applicable_percent = 19.0 # Placeholder
-    doc.trade.settlement.trade_tax.add(tax)
-
-    # Serialize to XML string
-    xml_str = doc.serialize(schema="FACTUR-X_EN16931").decode("utf-8")
+    # Seller
+    seller = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}SellerTradeParty")
+    s_name = ET.SubElement(seller, f"{{{NAMESPACES['ram']}}}Name")
+    s_name.text = data.get("sender", {}).get("name", "Seller Name")
     
-    # Post-process XML to inject schemeID for Buyer ID (drafthorse doesn't support it on StringField)
-    try:
-        import xml.etree.ElementTree as ET
+    s_address_node = ET.SubElement(seller, f"{{{NAMESPACES['ram']}}}PostalTradeAddress")
+    s_l1, s_zip, s_city = parse_address_fields(data.get("sender", {}).get("address_lines", []))
+    
+    if s_zip:
+        s_pc = ET.SubElement(s_address_node, f"{{{NAMESPACES['ram']}}}PostcodeCode")
+        s_pc.text = s_zip
+    if s_l1:
+        s_line1 = ET.SubElement(s_address_node, f"{{{NAMESPACES['ram']}}}LineOne")
+        s_line1.text = s_l1
+    if s_city:
+        s_city_name = ET.SubElement(s_address_node, f"{{{NAMESPACES['ram']}}}CityName")
+        s_city_name.text = s_city
         
-        # Register namespaces to prevent ns0 prefixes
-        namespaces = {
-            "rsm": "urn:un:unece:uncefact:data:standard:CrossIndustryInvoice:100",
-            "ram": "urn:un:unece:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100",
-            "udt": "urn:un:unece:uncefact:data:standard:UnqualifiedDataType:100",
-            "qdt": "urn:un:unece:uncefact:data:standard:QualifiedDataType:100",
-        }
-        for prefix, uri in namespaces.items():
-            ET.register_namespace(prefix, uri)
-            
-        root = ET.fromstring(xml_str)
+    s_country = ET.SubElement(s_address_node, f"{{{NAMESPACES['ram']}}}CountryID")
+    s_country.text = "DE" # Placeholder
+    
+    if data.get("sender_tax_id"):
+        clean_id, scheme = get_tax_scheme(data.get("sender_tax_id"))
+        tax_reg = ET.SubElement(seller, f"{{{NAMESPACES['ram']}}}SpecifiedTaxRegistration")
+        # BT-18: Only keep schemeID for VAT (VA). Proprietary IDs (FC etc) SHOULD NOT have schemeID attribute.
+        if scheme == "VA":
+            tr_id = ET.SubElement(tax_reg, f"{{{NAMESPACES['ram']}}}ID", {"schemeID": "VA"})
+        else:
+            tr_id = ET.SubElement(tax_reg, f"{{{NAMESPACES['ram']}}}ID")
+        tr_id.text = clean_id
         
-        # Find Buyer ID
-        # XPath: rsm:SupplyChainTradeTransaction/ram:ApplicableHeaderTradeAgreement/ram:BuyerTradeParty/ram:ID
-        buyer_id = root.find(".//ram:BuyerTradeParty/ram:ID", namespaces)
+    # BT-18: AdditionalReferencedDocument (Object Identifier / Project Reference)
+    if data.get("project_id"):
+        ref_doc = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}AdditionalReferencedDocument")
+        # BT-18: IssuerAssignedID MUST NOT have schemeID attribute for proprietary references
+        issuer_id = ET.SubElement(ref_doc, f"{{{NAMESPACES['ram']}}}IssuerAssignedID")
+        issuer_id.text = str(data.get("project_id"))
+        t_code = ET.SubElement(ref_doc, f"{{{NAMESPACES['ram']}}}TypeCode")
+        t_code.text = "130" # 130 = Invoicing Data Sheet
         
-        if buyer_id is not None and buyer_id.text:
-            # Set schemeID="91" (Seller assigned)
-            buyer_id.set("schemeID", "91")
-            
-        xml_str = ET.tostring(root, encoding="utf-8").decode("utf-8")
+    # BT-13: BuyerOrderReferencedDocument (Purchase Order Reference)
+    if data.get("order_id"):
+        order_ref = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}BuyerOrderReferencedDocument")
+        # BT-13: IssuerAssignedID MUST NOT have schemeID for proprietary IDs
+        order_issuer_id = ET.SubElement(order_ref, f"{{{NAMESPACES['ram']}}}IssuerAssignedID")
+        order_issuer_id.text = str(data.get("order_id"))
         
-        # Add XML declaration if missing (ET.tostring might omit it or add it differently)
-        if not xml_str.startswith("<?xml"):
-            xml_str = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_str
-            
-    except Exception as e:
-        print(f"Error post-processing XML: {e}")
-        # Fallback to original if hack fails
-        pass
+    buyer = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}BuyerTradeParty")
+    if data.get("customer_id"):
+        # Removing schemeID for BT-18 compliance unless valid ICD code provided
+        b_cid = ET.SubElement(buyer, f"{{{NAMESPACES['ram']}}}ID")
+        b_cid.text = data.get("customer_id")
+    
+    b_name = ET.SubElement(buyer, f"{{{NAMESPACES['ram']}}}Name")
+    b_name.text = data.get("recipient", {}).get("name", "Buyer Name")
+    
+    b_address_node = ET.SubElement(buyer, f"{{{NAMESPACES['ram']}}}PostalTradeAddress")
+    b_l1, b_zip, b_city = parse_address_fields(data.get("recipient", {}).get("address_lines", []))
+    
+    if b_zip:
+        b_pc = ET.SubElement(b_address_node, f"{{{NAMESPACES['ram']}}}PostcodeCode")
+        b_pc.text = b_zip
+    if b_l1:
+        b_line1 = ET.SubElement(b_address_node, f"{{{NAMESPACES['ram']}}}LineOne")
+        b_line1.text = b_l1
+    if b_city:
+        b_city_name = ET.SubElement(b_address_node, f"{{{NAMESPACES['ram']}}}CityName")
+        b_city_name.text = b_city
+        
+    b_country = ET.SubElement(b_address_node, f"{{{NAMESPACES['ram']}}}CountryID")
+    b_country.text = "DE" # Placeholder
+    
+    # -- Header Trade Delivery
+    delivery_header = ET.SubElement(transaction, f"{{{NAMESPACES['ram']}}}ApplicableHeaderTradeDelivery")
+    
+    # -- Header Trade Settlement
+    settlement_header = ET.SubElement(transaction, f"{{{NAMESPACES['ram']}}}ApplicableHeaderTradeSettlement")
+    curr_settle = ET.SubElement(settlement_header, f"{{{NAMESPACES['ram']}}}InvoiceCurrencyCode")
+    curr_settle.text = "EUR"
+    
+    # Payment Means
+    payment = ET.SubElement(settlement_header, f"{{{NAMESPACES['ram']}}}SpecifiedTradeSettlementPaymentMeans")
+    p_means_type = ET.SubElement(payment, f"{{{NAMESPACES['ram']}}}TypeCode")
+    p_means_type.text = "58" # SEPA
+    
+    p_account = ET.SubElement(payment, f"{{{NAMESPACES['ram']}}}PayeePartyCreditorFinancialAccount")
+    iban_elem = ET.SubElement(p_account, f"{{{NAMESPACES['ram']}}}IBANID")
+    iban_elem.text = data.get("footer", {}).get("iban", "").replace(" ", "")
+    
+    # Tax Breakdown (Header)
+    # Strictly enforced sequence: CalculatedAmount, TypeCode, BasisAmount, CategoryCode, RateApplicablePercent
+    h_tax = ET.SubElement(settlement_header, f"{{{NAMESPACES['ram']}}}ApplicableTradeTax")
+    
+    h_tax_calc = ET.SubElement(h_tax, f"{{{NAMESPACES['ram']}}}CalculatedAmount", {"currencyID": "EUR"})
+    h_tax_calc.text = f"{total_tax:.2f}"
+    
+    h_tax_type = ET.SubElement(h_tax, f"{{{NAMESPACES['ram']}}}TypeCode")
+    h_tax_type.text = "VAT"
+    
+    h_tax_basis = ET.SubElement(h_tax, f"{{{NAMESPACES['ram']}}}BasisAmount", {"currencyID": "EUR"})
+    h_tax_basis.text = f"{total_net:.2f}"
+    
+    h_tax_cat = ET.SubElement(h_tax, f"{{{NAMESPACES['ram']}}}CategoryCode")
+    h_tax_cat.text = "S"
+    
+    h_tax_rate = ET.SubElement(h_tax, f"{{{NAMESPACES['ram']}}}RateApplicablePercent")
+    h_tax_rate.text = "19.00"
+    
+    # BT-9 / BT-20: SpecifiedTradePaymentTerms
+    terms = ET.SubElement(settlement_header, f"{{{NAMESPACES['ram']}}}SpecifiedTradePaymentTerms")
+    issue_dt = data.get("date", datetime.date.today())
+    due_dt = data.get("due_date")
+    if not due_dt:
+        due_dt = issue_dt + datetime.timedelta(days=14)
+    
+    due_dt_node = ET.SubElement(terms, f"{{{NAMESPACES['ram']}}}DueDateDateTime")
+    due_dt_str = ET.SubElement(due_dt_node, f"{{{NAMESPACES['udt']}}}DateTimeString", {"format": "102"})
+    due_dt_str.text = due_dt.strftime("%Y%m%d")
+    
+    total_net = round(total_net, 2)
+    total_tax = round(total_tax, 2)
+    grand_total = round(total_net + total_tax, 2)
 
+    # Monetary Summation
+    summation = ET.SubElement(settlement_header, f"{{{NAMESPACES['ram']}}}SpecifiedTradeSettlementHeaderMonetarySummation")
+    s_line_total = ET.SubElement(summation, f"{{{NAMESPACES['ram']}}}LineTotalAmount", {"currencyID": "EUR"})
+    s_line_total.text = f"{total_net:.2f}"
+    s_charge = ET.SubElement(summation, f"{{{NAMESPACES['ram']}}}ChargeTotalAmount", {"currencyID": "EUR"})
+    s_charge.text = "0.00"
+    s_allowance = ET.SubElement(summation, f"{{{NAMESPACES['ram']}}}AllowanceTotalAmount", {"currencyID": "EUR"})
+    s_allowance.text = "0.00"
+    s_tax_basis = ET.SubElement(summation, f"{{{NAMESPACES['ram']}}}TaxBasisTotalAmount", {"currencyID": "EUR"})
+    s_tax_basis.text = f"{total_net:.2f}"
+    s_tax_total = ET.SubElement(summation, f"{{{NAMESPACES['ram']}}}TaxTotalAmount", {"currencyID": "EUR"})
+    s_tax_total.text = f"{total_tax:.2f}"
+    s_grand = ET.SubElement(summation, f"{{{NAMESPACES['ram']}}}GrandTotalAmount", {"currencyID": "EUR"})
+    s_grand.text = f"{grand_total:.2f}"
+    s_due = ET.SubElement(summation, f"{{{NAMESPACES['ram']}}}DuePayableAmount", {"currencyID": "EUR"})
+    s_due.text = f"{grand_total:.2f}"
+    
+    # Serialize
+    xml_bytes = ET.tostring(root, encoding="utf-8")
+    xml_str = xml_bytes.decode("utf-8")
+    if not xml_str.startswith("<?xml"):
+        xml_str = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_str
+        
     return xml_str
 
 from fpdf import FPDF
@@ -337,17 +428,13 @@ def generate_invoice_pdf(data):
     total_tax_accumulated = 0.0
     
     for item in data.get("items", []):
-        desc = item.get("Description", "")
-        qty = float(item.get("Quantity (hours)", 0) or 0)
-        price = float(item.get("Price per Hour (€)", 0) or 0)
+        desc = item.get("name", item.get("Description", ""))
+        qty = float(item.get("qty", item.get("Quantity (hours)", 0)) or 0)
+        price = float(item.get("price", item.get("Price per Hour (€)", 0)) or 0)
+        vat_rate = float(item.get("vat_percent", 19.0)) / 100.0
         
-        # Use values passed from UI (which might be manually edited)
-        net_line = float(item.get("Total (€)", 0) or 0)
-        tax_line = float(item.get("Tax 19% (€)", 0) or 0)
-        
-        if net_line == 0 and qty*price != 0: net_line = qty * price
-        if tax_line == 0 and net_line != 0: tax_line = net_line * 0.19
-        
+        net_line = round(qty * price, 2)
+        tax_line = round(net_line * vat_rate, 2)
         total_incl = net_line + tax_line
         
         total_net += net_line

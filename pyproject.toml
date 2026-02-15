@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "drafthorse>=2025.2.0",
+    "fastapi>=0.129.0",
     "fpdf2>=2.8.5",
     "streamlit>=1.53.1",
     "streamlit-pdf-viewer>=0.0.27",
+    "uvicorn>=0.40.0",
 ]
