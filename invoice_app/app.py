@@ -97,6 +97,24 @@ with tab_input:
         s_name_addr = st.text_area("Name & Address", key="sender_name_area", value="My Company GmbH\nMain Street 1\n12345 Berlin")
         s_tax = st.text_input("VAT ID", key="sender_tax_id_in", value="DE123456789")
         
+        st.markdown("---")
+        st.write("Firmenlogo (Rechts oben)")
+        uploaded_logo = st.file_uploader("Logo hochladen (PNG)", type="png", key="logo_uploader")
+        
+        assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+        if not os.path.exists(assets_dir):
+            os.makedirs(assets_dir)
+            
+        logo_path = os.path.join(assets_dir, "logo.png")
+        
+        if uploaded_logo is not None:
+            with open(logo_path, "wb") as f:
+                f.write(uploaded_logo.getbuffer())
+            st.success("Logo gespeichert!")
+        
+        if os.path.exists(logo_path):
+            st.image(logo_path, width=100)
+        
     with col_r:
         st.subheader("Recipient")
         recipient_options = ["Select from History..."] + [r["name_address"].split('\n')[0] for r in history.get("recipients", [])]
@@ -178,7 +196,8 @@ with tab_input:
                 "col2": f_col2,
                 "col3": f_col3
             },
-            "unit_code": "C62"
+            "unit_code": "C62",
+            "logo_path": logo_path if os.path.exists(logo_path) else None
         }
         
         try:

@@ -5,14 +5,16 @@ __pycache__/
 .venv/
 .env
 
-# App specific
-.invoice_counter
-
 # MacOS
 .DS_Store
-invoice_history.json
 
-# Personal debug/test scripts
+#debug/test scripts
 debug_xml.py
 debug_xml_header.py
 test_full_fields.py
+
+# Personal 
+invoice_history.json
+.invoice_counter
+assets/logo.png
+*.png

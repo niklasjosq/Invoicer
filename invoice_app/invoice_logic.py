@@ -190,22 +190,6 @@ def generate_facturx_xml(data):
             tr_id = ET.SubElement(tax_reg, f"{{{NAMESPACES['ram']}}}ID")
         tr_id.text = clean_id
         
-    # BT-18: AdditionalReferencedDocument (Object Identifier / Project Reference)
-    if data.get("project_id"):
-        ref_doc = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}AdditionalReferencedDocument")
-        # BT-18: IssuerAssignedID MUST NOT have schemeID attribute for proprietary references
-        issuer_id = ET.SubElement(ref_doc, f"{{{NAMESPACES['ram']}}}IssuerAssignedID")
-        issuer_id.text = str(data.get("project_id"))
-        t_code = ET.SubElement(ref_doc, f"{{{NAMESPACES['ram']}}}TypeCode")
-        t_code.text = "130" # 130 = Invoicing Data Sheet
-        
-    # BT-13: BuyerOrderReferencedDocument (Purchase Order Reference)
-    if data.get("order_id"):
-        order_ref = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}BuyerOrderReferencedDocument")
-        # BT-13: IssuerAssignedID MUST NOT have schemeID for proprietary IDs
-        order_issuer_id = ET.SubElement(order_ref, f"{{{NAMESPACES['ram']}}}IssuerAssignedID")
-        order_issuer_id.text = str(data.get("order_id"))
-        
     buyer = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}BuyerTradeParty")
     if data.get("customer_id"):
         # Removing schemeID for BT-18 compliance unless valid ICD code provided
@@ -230,6 +214,22 @@ def generate_facturx_xml(data):
         
     b_country = ET.SubElement(b_address_node, f"{{{NAMESPACES['ram']}}}CountryID")
     b_country.text = "DE" # Placeholder
+
+    # BT-13: BuyerOrderReferencedDocument (Purchase Order Reference)
+    if data.get("order_id"):
+        order_ref = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}BuyerOrderReferencedDocument")
+        # BT-13: IssuerAssignedID MUST NOT have schemeID for proprietary IDs
+        order_issuer_id = ET.SubElement(order_ref, f"{{{NAMESPACES['ram']}}}IssuerAssignedID")
+        order_issuer_id.text = str(data.get("order_id"))
+
+    # BT-18: AdditionalReferencedDocument (Object Identifier / Project Reference)
+    if data.get("project_id"):
+        ref_doc = ET.SubElement(header_agreement, f"{{{NAMESPACES['ram']}}}AdditionalReferencedDocument")
+        # BT-18: IssuerAssignedID MUST NOT have schemeID attribute for proprietary references
+        issuer_id = ET.SubElement(ref_doc, f"{{{NAMESPACES['ram']}}}IssuerAssignedID")
+        issuer_id.text = str(data.get("project_id"))
+        t_code = ET.SubElement(ref_doc, f"{{{NAMESPACES['ram']}}}TypeCode")
+        t_code.text = "50" # 50 = Project Reference
     
     # -- Header Trade Delivery
     delivery_header = ET.SubElement(transaction, f"{{{NAMESPACES['ram']}}}ApplicableHeaderTradeDelivery")
@@ -349,6 +349,15 @@ def generate_invoice_pdf(data):
     # Use Arial if available, else fallback to Helvetica (though internal Helvetica is not embedded)
     font_family = "Arial" if os.path.exists(arial_path) else "Helvetica"
     
+    # Logo
+    if data.get("logo_path"):
+        try:
+            # Position: Right top. A4 width 210mm. Right margin 10mm. Logo width 30mm.
+            # x = 210 - 10 - 30 = 170
+            pdf.image(data["logo_path"], x=170, y=10, w=30)
+        except Exception as e:
+            print(f"Error loading logo: {e}")
+
     pdf.set_font(font_family, size=12)
     
     # Title
