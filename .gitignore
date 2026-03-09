@@ -18,3 +18,4 @@ invoice_history.json
 .invoice_counter
 assets/logo.png
 *.png
+transactions.json
