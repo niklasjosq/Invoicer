@@ -105,7 +105,32 @@ KATEGORIE_MAPPING = {
         "kz_tax": "66",
         "type": "Ausgabe",
         "group": "Eingangsrechnungen"
-    }
+    },
+
+    # ============ STEUERFREIE LIEFERUNGEN ============
+    "Aus: Steuerfreie innergemeinschaftliche Lieferungen": {
+        "kz_base": "41",
+        "tax_rate": 0.0,
+        "kz_tax": None,
+        "type": "Einnahme",
+        "group": "Ausgangsrechnungen"
+    },
+    "Aus: Umsätze zum Steuersatz 0%": {
+        "kz_base": "87",
+        "tax_rate": 0.0,
+        "kz_tax": None,
+        "type": "Einnahme",
+        "group": "Ausgangsrechnungen"
+    },
+
+    # ============ §13b REVERSE CHARGE ============
+    "Ein: Vorsteuer aus §13b Leistungen": {
+        "kz_base": None,
+        "tax_rate": 0.0,
+        "kz_tax": "67",
+        "type": "Ausgabe",
+        "group": "Eingangsrechnungen"
+    },
 }
 
 def parse_facturx_xml(xml_content):
@@ -345,8 +370,9 @@ def calculate_ustva_totals(transactions, month, year):
     sum_sales_vat += Decimal(kz_base_rounded.get("89", 0)) * Decimal("0.19")
     sum_sales_vat = _to_money(sum_sales_vat)
 
+    # Sum ALL input tax Kennzahlen (66, 61, 67, etc.)
     sum_input_tax = _to_money(
-        kz_input_tax_sums.get("66", Decimal("0.00")) + kz_input_tax_sums.get("61", Decimal("0.00"))
+        sum(kz_input_tax_sums.values(), Decimal("0.00"))
     )
     zahllast = _to_money(sum_sales_vat - sum_input_tax)
 
@@ -360,38 +386,36 @@ def calculate_ustva_totals(transactions, month, year):
         "zahllast": float(zahllast),
     }
 
-def generate_ustva_xml(transactions, month, year, stnr="", name="", vorname=""):
+def generate_ustva_xml(transactions, month, year, stnr="", name="", vorname="",
+                       strasse="", plz="", ort=""):
     """
-    Generates a rudimentary ELSTER UStVA XML.
+    Generates ELSTER UStVA XML for Mein ELSTER import.
     Filters transactions by payment_date matching month/year.
     """
     totals = calculate_ustva_totals(transactions, month, year)
     kz_base_rounded = totals["kz_base_rounded"]
     kz_input_tax_sums = totals["kz_input_tax_sums"]
-    base_81 = kz_base_rounded.get("81", 0)
-    base_86 = kz_base_rounded.get("86", 0)
-    base_89 = kz_base_rounded.get("89", 0)
-    val_66 = kz_input_tax_sums.get("66", 0.0)
-    val_61 = kz_input_tax_sums.get("61", 0.0)
     kz_83 = totals["zahllast"]
-    
-    # Formatting helper
+
     def fmt_amt(val):
         return f"{val:.2f}"
-    
-    # XML Structure for "Mein ELSTER" Import (Formular-Import)
-    # Namespace matches the year version (e.g., v2025, v2026)
+
     ns_url = f"http://finkonsens.de/elster/elsteranmeldung/ustva/v{year}"
-    
+
     root = ET.Element("Anmeldungssteuern", {
         "xmlns": ns_url,
         "version": str(year)
     })
 
-    # Compatibility for ELSTER form import:
-    # include creation date on root level.
+    # DatenLieferant block (required by Mein ELSTER for import)
+    datenlieferant = ET.SubElement(root, "DatenLieferant")
+    ET.SubElement(datenlieferant, "Name").text = str(name or "")
+    ET.SubElement(datenlieferant, "Strasse").text = str(strasse or "")
+    ET.SubElement(datenlieferant, "PLZ").text = str(plz or "")
+    ET.SubElement(datenlieferant, "Ort").text = str(ort or "")
+
     ET.SubElement(root, "Erstellungsdatum").text = datetime.date.today().strftime("%Y%m%d")
-    
+
     steuerfall = ET.SubElement(root, "Steuerfall")
 
     unternehmer = ET.SubElement(steuerfall, "Unternehmer")
@@ -400,38 +424,32 @@ def generate_ustva_xml(transactions, month, year, stnr="", name="", vorname=""):
     ET.SubElement(unternehmer, "Vorname").text = str(vorname or "")
 
     ustva = ET.SubElement(steuerfall, "Umsatzsteuervoranmeldung")
-    
+
     ET.SubElement(ustva, "Jahr").text = str(year)
     ET.SubElement(ustva, "Zeitraum").text = f"{month:02d}"
     if stnr:
         ET.SubElement(ustva, "Steuernummer").text = str(stnr)
-    
-    # Populate Fields
-    # Bemessungsgrundlagen: Full Euro (integer)
-    if base_81 > 0:
-        ET.SubElement(ustva, "Kz81").text = str(int(base_81))
-    if base_86 > 0:
-        ET.SubElement(ustva, "Kz86").text = str(int(base_86))
-    if base_89 > 0:
-        ET.SubElement(ustva, "Kz89").text = str(int(base_89))
-        
-    # Steuerbeträge: 2 decimals
-    if val_66 > 0:
-        ET.SubElement(ustva, "Kz66").text = fmt_amt(val_66)
-    if val_61 > 0:
-        ET.SubElement(ustva, "Kz61").text = fmt_amt(val_61)
-        
-    # Kz 83 is mandatory usually
+
+    # Bemessungsgrundlagen: full EUR (integer), emit all populated Kz
+    # Kz values for base amounts (e.g. 81, 86, 87, 89, 41, ...)
+    BASE_KZ = {"81", "86", "87", "89", "41"}
+    for kz in sorted(kz_base_rounded.keys()):
+        val = kz_base_rounded[kz]
+        if val != 0:
+            ET.SubElement(ustva, f"Kz{kz}").text = str(int(val))
+
+    # Steuerbeträge: 2 decimals (Kz66, Kz61, Kz67, ...)
+    for kz in sorted(kz_input_tax_sums.keys()):
+        val = kz_input_tax_sums[kz]
+        if val != 0:
+            ET.SubElement(ustva, f"Kz{kz}").text = fmt_amt(val)
+
+    # Kz83 is mandatory (Verbleibende USt-Vorauszahlung / Überschuss)
     ET.SubElement(ustva, "Kz83").text = fmt_amt(kz_83)
-    
-    # Generate bytes with correct encoding
-    # We use ISO-8859-15 as requested by ELSTER
-    # xml_declaration=False prevents ET from adding its own header (avoiding duplication)
+
     xml_bytes = ET.tostring(root, encoding="iso-8859-15", xml_declaration=False)
-    
-    # Prepend the correct XML declaration manually
     header = b'<?xml version="1.0" encoding="ISO-8859-15" standalone="no"?>\n'
-    
+
     return header + xml_bytes
 
 def generate_euer_xml(transactions, year):

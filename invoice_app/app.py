@@ -93,8 +93,41 @@ def save_transactions(data):
 
 def add_transaction(t):
     ts = load_transactions()
+    # Prevent duplicate invoice IDs
+    if t.get("id") and any(existing["id"] == t["id"] for existing in ts):
+        return False
     ts.append(t)
     save_transactions(ts)
+    return True
+
+# --- Invoice Counter ---
+COUNTER_FILE = ".invoice_counter"
+
+def load_counter():
+    if not os.path.exists(COUNTER_FILE):
+        return 1
+    try:
+        with open(COUNTER_FILE, "r") as f:
+            return int(f.read().strip())
+    except:
+        return 1
+
+def save_counter(val):
+    with open(COUNTER_FILE, "w") as f:
+        f.write(str(val))
+
+def next_invoice_id(inv_date, recipient_name):
+    """Generate INV-YYYY-MM-DD-NNN_Customer format.
+    Counter uses minimum 3 digits but grows naturally (001...999, 1000, 1001...).
+    """
+    counter = load_counter()
+    # Sanitize customer name: first word, alphanumeric only
+    customer = recipient_name.split("\n")[0].strip().split()[0] if recipient_name.strip() else "Customer"
+    customer = "".join(c for c in customer if c.isalnum() or c in "-_")
+    date_str = inv_date.strftime("%Y-%m-%d")
+    counter_str = str(counter).zfill(3)  # min 3 digits, grows beyond 999 naturally
+    inv_id = f"INV-{date_str}-{counter_str}_{customer}"
+    return inv_id, counter
 
 # Default values
 DEFAULT_ITEM = {"name": "Consulting Services", "qty": 1.0, "price": 100.0, "vat_percent": 19.0}
@@ -163,9 +196,13 @@ with tab_input:
 
     st.subheader("Invoice Details")
     c1, c2, c3 = st.columns(3)
-    inv_id = c1.text_input("Invoice Number", value="INV-2026-001")
     inv_date = c2.date_input("Invoice Date", value=datetime.date.today())
     due_date = c3.date_input("Due Date (BT-9)", value=inv_date + datetime.timedelta(days=14))
+
+    # Auto-generate invoice ID from date + counter + customer name
+    auto_id, _counter_val = next_invoice_id(inv_date, r_name_addr)
+    inv_id = c1.text_input("Invoice Number", value=auto_id,
+                           help="Format: INV-YYYY-MM-DD-NNN_Customer. Auto-generated, editable.")
     
     c4, c5 = st.columns(2)
     project_id = c4.text_input("Project ID (BT-18)", value="", help="Internal project or object reference.")
@@ -252,6 +289,10 @@ with tab_input:
             st.session_state.zugferd_pdf = create_zugferd_pdf(pdf_bytes, st.session_state.xml_content)
             add_to_history(data)
 
+            # Increment counter for next invoice
+            save_counter(_counter_val + 1)
+            st.session_state.last_inv_id = inv_id
+
             # Hook: Add to transactions
             # Determine category based on tax rate
             # Heuristic: 19% = Umsatzerlöse (Dienstleistungen) 19%, 7% = Umsatzerlöse (Dienstleistungen) 7%
@@ -285,68 +326,157 @@ with tab_input:
 with tab_xml:
     st.header("XML Preview")
     if st.session_state.xml_content:
+        dl_id = st.session_state.get("last_inv_id", inv_id)
         st.code(st.session_state.xml_content, language="xml")
-        st.download_button("Download XML", st.session_state.xml_content, "factur-x.xml", "text/xml")
+        st.download_button("Download XML", st.session_state.xml_content, f"{dl_id}.xml", "text/xml")
 
 with tab_pdf:
     st.header("PDF Preview")
     if st.session_state.zugferd_pdf:
+        dl_id = st.session_state.get("last_inv_id", inv_id)
         pdf_viewer(st.session_state.zugferd_pdf, width=800)
-        st.download_button("Download ZUGFeRD PDF", st.session_state.zugferd_pdf, f"{inv_id}.pdf", "application/pdf")
+        st.download_button("Download ZUGFeRD PDF", st.session_state.zugferd_pdf, f"{dl_id}.pdf", "application/pdf")
 
 with tab_scanner:
-    st.header("Invoice Scanner")
-    
+    st.header("📂 Invoice Scanner")
+
+    # Initialize session state for scanned invoices
+    if "scanned_invoices" not in st.session_state:
+        st.session_state.scanned_invoices = []
+    if "scan_skipped" not in st.session_state:
+        st.session_state.scan_skipped = []
+
     # Directory input
     default_dir = os.getenv("INVOICE_DIRECTORY", ".")
     invoice_dir = st.text_input("Invoice Directory", value=default_dir)
-    
-    if st.button("Scan Directory"):
+
+    if st.button("🔍 Scan Directory", type="primary"):
         if not os.path.exists(invoice_dir):
             st.error("Directory not found!")
         else:
-            found_files = []
-            for root, dirs, files in os.walk(invoice_dir):
+            # Collect files, deduplicate by filename stem (prefer PDF over XML)
+            all_files = {}
+            for scan_root, dirs, files in os.walk(invoice_dir):
                 for file in files:
                     if file.lower().endswith((".pdf", ".xml")):
-                         found_files.append(os.path.join(root, file))
-            
-            st.info(f"Found {len(found_files)} potential invoice files.")
-            
-            new_txs = []
+                        stem = os.path.splitext(file)[0]
+                        fpath_candidate = os.path.join(scan_root, file)
+                        if stem not in all_files or file.lower().endswith(".pdf"):
+                            all_files[stem] = fpath_candidate
+            found_files = list(all_files.values())
+
+            st.info(f"Found {len(found_files)} unique invoice files.")
+
+            scanned = []
+            skipped = []
             current_txs = load_transactions()
-            current_ids = [t["id"] for t in current_txs]
-            
+            current_ids = {t["id"] for t in current_txs}
+
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
+
             for i, fpath in enumerate(found_files):
                 status_text.text(f"Processing {os.path.basename(fpath)}...")
                 data = None
-                
-                # Simple Logic: Process both, ID check prevents duplicates
+
                 if fpath.lower().endswith(".pdf"):
                     data = extract_data_from_pdf(fpath)
                 elif fpath.lower().endswith(".xml"):
                     data = extract_data_from_xml_file(fpath)
-                
+
                 if data:
-                    # Check if already exists
                     if data["id"] and data["id"] not in current_ids:
-                        new_txs.append(data)
-                        current_ids.append(data["id"])
-                
+                        data["_import"] = True  # Checkbox default
+                        data["_source"] = os.path.basename(fpath)
+                        scanned.append(data)
+                        current_ids.add(data["id"])
+                    else:
+                        skipped.append({"file": os.path.basename(fpath), "id": data.get("id", "?"), "reason": "Already imported"})
+
                 progress_bar.progress((i + 1) / len(found_files))
-            
+
             status_text.text("Scan complete!")
-            
-            if new_txs:
-                st.success(f"Successfully imported {len(new_txs)} new invoices!")
-                current_txs.extend(new_txs)
-                save_transactions(current_txs)
-                st.dataframe(new_txs)
-            else:
-                st.warning("No new invoices found or extracted.")
+            st.session_state.scanned_invoices = scanned
+            st.session_state.scan_skipped = skipped
+
+    # Show skipped files
+    if st.session_state.scan_skipped:
+        with st.expander(f"⏭️ Skipped {len(st.session_state.scan_skipped)} duplicates"):
+            st.dataframe(st.session_state.scan_skipped, use_container_width=True)
+
+    # Interactive review table
+    if st.session_state.scanned_invoices:
+        st.subheader(f"📋 Review {len(st.session_state.scanned_invoices)} scanned invoices")
+        st.info("Review and adjust categories, set payment dates, then import selected invoices.")
+
+        scanner_col_config = {
+            "_import": st.column_config.CheckboxColumn("Import", default=True),
+            "_source": st.column_config.TextColumn("Source File", disabled=True),
+            "id": st.column_config.TextColumn("Invoice Nr.", disabled=True),
+            "date": st.column_config.TextColumn("Invoice Date", disabled=True),
+            "partner": st.column_config.TextColumn("Partner", disabled=True),
+            "net_amount": st.column_config.NumberColumn("Net (€)", format="%.2f €", disabled=True),
+            "tax_amount": st.column_config.NumberColumn("VAT (€)", format="%.2f €", disabled=True),
+            "gross_amount": st.column_config.NumberColumn("Gross (€)", format="%.2f €", disabled=True),
+            "type": st.column_config.SelectboxColumn("Type", options=["Einnahme", "Ausgabe"], required=True),
+            "payment_date": st.column_config.DateColumn(
+                "Payment Date",
+                format="DD.MM.YYYY",
+                help="Set when paid to include in UStVA",
+                min_value=datetime.date(2020, 1, 1),
+                max_value=datetime.date(2030, 12, 31),
+            ),
+            "category": st.column_config.SelectboxColumn(
+                "Category",
+                options=list(KATEGORIE_MAPPING.keys()),
+                required=True,
+            ),
+            "vat_id": st.column_config.TextColumn("VAT ID", disabled=True),
+        }
+
+        column_order = ["_import", "_source", "id", "date", "partner", "net_amount", "tax_amount",
+                        "gross_amount", "type", "payment_date", "category"]
+
+        edited_scanned = st.data_editor(
+            st.session_state.scanned_invoices,
+            key="scanner_editor",
+            num_rows="fixed",
+            use_container_width=True,
+            column_config=scanner_col_config,
+            column_order=column_order,
+        )
+
+        col_import, col_clear = st.columns([1, 1])
+
+        with col_import:
+            if st.button("✅ Import Selected", type="primary"):
+                to_import = [t for t in edited_scanned if t.get("_import", False)]
+                if not to_import:
+                    st.warning("No invoices selected for import.")
+                else:
+                    current_txs = load_transactions()
+                    current_ids = {t["id"] for t in current_txs}
+                    imported = 0
+                    for t in to_import:
+                        # Remove internal fields before saving
+                        tx = {k: v for k, v in t.items() if not k.startswith("_")}
+                        if tx["id"] not in current_ids:
+                            current_txs.append(tx)
+                            current_ids.add(tx["id"])
+                            imported += 1
+                    save_transactions(current_txs)
+                    st.success(f"Imported {imported} invoices!")
+                    st.session_state.scanned_invoices = []
+                    st.session_state.scan_skipped = []
+                    st.rerun()
+
+        with col_clear:
+            if st.button("🗑️ Clear Scan Results"):
+                st.session_state.scanned_invoices = []
+                st.session_state.scan_skipped = []
+                st.rerun()
+    elif not st.session_state.scanned_invoices:
+        st.caption("Scan a directory to find and review invoices before importing.")
 
 with tab_ustva:
     st.header("UStVA (Monatlich)")
@@ -370,6 +500,12 @@ with tab_ustva:
     )
     ustva_name = col_tax_2.text_input("Nachname/Firmenname", key="ustva_name")
     ustva_vorname = col_tax_3.text_input("Vorname", key="ustva_vorname")
+
+    st.markdown("### Adresse (DatenLieferant)")
+    col_addr1, col_addr2, col_addr3 = st.columns(3)
+    ustva_strasse = col_addr1.text_input("Straße", key="ustva_strasse")
+    ustva_plz = col_addr2.text_input("PLZ", key="ustva_plz")
+    ustva_ort = col_addr3.text_input("Ort", key="ustva_ort")
     
     st.markdown("### Eingangsrechnungen hochladen")
     uploaded_files = st.file_uploader("ZUGFeRD/XRechnung PDFs", accept_multiple_files=True, type="pdf")
@@ -434,74 +570,55 @@ with tab_ustva:
         # We allow ALL options in dropdown to enable fixing wrong categories
         return list(KATEGORIE_MAPPING.keys())
     
+    # Shared column config for both editors
+    def make_tx_col_config():
+        return {
+            "id": st.column_config.TextColumn("Rechnungs-Nr."),
+            "date": st.column_config.DateColumn("Rechnungsdatum", format="DD.MM.YYYY"),
+            "partner": st.column_config.TextColumn("Partner"),
+            "net_amount": st.column_config.NumberColumn("Netto (€)", format="%.2f €"),
+            "tax_amount": st.column_config.NumberColumn("MwSt (€)", format="%.2f €"),
+            "gross_amount": st.column_config.NumberColumn("Brutto (€)", format="%.2f €"),
+            "type": st.column_config.SelectboxColumn("Typ", options=["Einnahme", "Ausgabe"], required=True),
+            "payment_date": st.column_config.DateColumn(
+                "Zahldatum",
+                format="DD.MM.YYYY",
+                help="Wann wurde die Rechnung bezahlt?",
+                min_value=datetime.date(2020, 1, 1),
+                max_value=datetime.date(2030, 12, 31),
+                step=1
+            ),
+            "category": st.column_config.SelectboxColumn(
+                "Kategorie (ELSTER)",
+                options=list(KATEGORIE_MAPPING.keys()),
+                help="Wähle die passende Kategorie",
+                required=True
+            ),
+        }
+
     # Separate data editors for Einnahmen (Ausgangsrechnungen) and Ausgaben (Eingangsrechnungen)
     st.subheader("📤 Ausgangsrechnungen (Einnahmen)")
-    # Filter strictly by Type
+    st.caption("Zeilen auswählen und mit Entf/Delete löschen. Kategorien und alle Felder sind editierbar.")
     ausgangs_txs = [t for t in transactions if t.get("type") == "Einnahme"]
-    
-    ausgaben_col_config = {
-        "id": st.column_config.TextColumn("Rechnungs-Nr.", disabled=True),
-        "date": st.column_config.DateColumn("Rechnungsdatum", format="DD.MM.YYYY"),
-        "partner": st.column_config.TextColumn("Partner"),
-        "net_amount": st.column_config.NumberColumn("Netto (€)", format="%.2f €"),
-        "tax_amount": st.column_config.NumberColumn("MwSt (€)", format="%.2f €"),
-        "gross_amount": st.column_config.NumberColumn("Brutto (€)", format="%.2f €"),
-        "type": st.column_config.SelectboxColumn("Typ", options=["Einnahme", "Ausgabe"], required=True),
-        "payment_date": st.column_config.DateColumn(
-            "Zahldatum",
-            format="DD.MM.YYYY",
-            help="Wann wurde die Rechnung bezahlt?",
-            min_value=datetime.date(2020, 1, 1),
-            max_value=datetime.date(2030, 12, 31),
-            step=1
-        ),
-        "category": st.column_config.SelectboxColumn(
-            "Kategorie (ELSTER)",
-            options=get_category_options("Einnahme"),
-            help="Wähle die passende Kategorie",
-            required=True
-        )
-    }
+
     edited_ausgangs = st.data_editor(
         ausgangs_txs,
         key="ausgangs_editor",
         num_rows="dynamic",
         use_container_width=True,
-        column_config=ausgaben_col_config
+        column_config=make_tx_col_config(),
     )
-    
+
     st.subheader("📥 Eingangsrechnungen (Ausgaben)")
+    st.caption("Zeilen auswählen und mit Entf/Delete löschen. Kategorien und alle Felder sind editierbar.")
     eingangs_txs = [t for t in transactions if t.get("type") == "Ausgabe"]
-    
-    eingangs_col_config = {
-        "id": st.column_config.TextColumn("Rechnungs-Nr.", disabled=True),
-        "date": st.column_config.DateColumn("Rechnungsdatum", format="DD.MM.YYYY"),
-        "partner": st.column_config.TextColumn("Partner"),
-        "net_amount": st.column_config.NumberColumn("Netto (€)", format="%.2f €"),
-        "tax_amount": st.column_config.NumberColumn("MwSt (€)", format="%.2f €"),
-        "gross_amount": st.column_config.NumberColumn("Brutto (€)", format="%.2f €"),
-        "type": st.column_config.SelectboxColumn("Typ", options=["Einnahme", "Ausgabe"], required=True),
-        "payment_date": st.column_config.DateColumn(
-            "Zahldatum",
-            format="DD.MM.YYYY",
-            help="Wann wurde die Rechnung bezahlt?",
-            min_value=datetime.date(2020, 1, 1),
-            max_value=datetime.date(2030, 12, 31),
-            step=1
-        ),
-        "category": st.column_config.SelectboxColumn(
-            "Kategorie (ELSTER)",
-            options=get_category_options("Ausgabe"),
-            help="Wähle die passende Kategorie",
-            required=True
-        )
-    }
+
     edited_eingangs = st.data_editor(
         eingangs_txs,
         key="eingangs_editor",
         num_rows="dynamic",
         use_container_width=True,
-        column_config=eingangs_col_config
+        column_config=make_tx_col_config(),
     )
     
     # Catch-all for transactions with missing/wrong type
@@ -547,6 +664,9 @@ with tab_ustva:
         stnr=ustva_stnr,
         name=ustva_name,
         vorname=ustva_vorname,
+        strasse=ustva_strasse,
+        plz=ustva_plz,
+        ort=ustva_ort,
     )
     
     # Calculate UStVA metrics matching ELSTER logic
@@ -569,8 +689,78 @@ with tab_ustva:
     m1.metric("Umsatzsteuer (Einnahmen)", f"{sum_sales_vat:.2f} €")
     m2.metric("Vorsteuer (Ausgaben)", f"{sum_input_tax:.2f} €")
     m3.metric("Zahllast", f"{zahllast:.2f} €", delta_color="inverse")
-    
-    st.download_button("Download UStVA XML (ELSTER)", ustva_xml, f"ustva_{sel_year}_{sel_month:02d}.xml", "text/xml")
+
+    # Visual UStVA form preview matching official USt 1 A
+    kz_base_rounded = totals["kz_base_rounded"]
+    with st.expander("📋 UStVA Formular (Vorschau)", expanded=False):
+        st.caption(f"Voranmeldungszeitraum: {sel_month:02d}/{sel_year}")
+
+        # Section A: Steuerpflichtige Umsätze
+        base_81 = kz_base_rounded.get("81", 0)
+        base_86 = kz_base_rounded.get("86", 0)
+        base_87 = kz_base_rounded.get("87", 0)
+        if base_81 or base_86 or base_87:
+            st.markdown("**A. Steuerpflichtige Lieferungen und sonstige Leistungen**")
+            form_a = []
+            if base_81:
+                form_a.append({"Zeile": 13, "Beschreibung": "zum Steuersatz von 19 %", "Kz": 81,
+                               "Bemessungsgrundlage (€)": f"{base_81:,}", "Steuer (€)": f"{base_81 * 0.19:.2f}"})
+            if base_86:
+                form_a.append({"Zeile": 14, "Beschreibung": "zum Steuersatz von 7 %", "Kz": 86,
+                               "Bemessungsgrundlage (€)": f"{base_86:,}", "Steuer (€)": f"{base_86 * 0.07:.2f}"})
+            if base_87:
+                form_a.append({"Zeile": 15, "Beschreibung": "zum Steuersatz von 0 %", "Kz": 87,
+                               "Bemessungsgrundlage (€)": f"{base_87:,}", "Steuer (€)": "—"})
+            st.dataframe(form_a, use_container_width=True, hide_index=True)
+
+        # Section B: Steuerfreie Umsätze
+        base_41 = kz_base_rounded.get("41", 0)
+        if base_41:
+            st.markdown("**B. Steuerfreie Lieferungen und sonstige Leistungen**")
+            form_b = [{"Zeile": 19, "Beschreibung": "Innergemeinschaftliche Lieferungen (§4 Nr.1b)", "Kz": 41,
+                        "Bemessungsgrundlage (€)": f"{base_41:,}"}]
+            st.dataframe(form_b, use_container_width=True, hide_index=True)
+
+        # Section C: Innergemeinschaftliche Erwerbe
+        base_89 = kz_base_rounded.get("89", 0)
+        val_61 = kz_input_tax_sums.get("61", 0.0)
+        if base_89:
+            st.markdown("**C. Innergemeinschaftliche Erwerbe**")
+            form_c = [{"Zeile": 25, "Beschreibung": "zum Steuersatz von 19 %", "Kz": 89,
+                        "Bemessungsgrundlage (€)": f"{base_89:,}", "Steuer (€)": f"{base_89 * 0.19:.2f}"}]
+            st.dataframe(form_c, use_container_width=True, hide_index=True)
+
+        # Section F: Abziehbare Vorsteuerbeträge
+        val_66 = kz_input_tax_sums.get("66", 0.0)
+        val_67 = kz_input_tax_sums.get("67", 0.0)
+        if val_66 or val_61 or val_67:
+            st.markdown("**F. Abziehbare Vorsteuerbeträge**")
+            form_f = []
+            if val_66:
+                form_f.append({"Zeile": 38, "Beschreibung": "Vorsteuerbeträge aus Rechnungen", "Kz": 66,
+                               "Betrag (€)": f"{val_66:.2f}"})
+            if val_61:
+                form_f.append({"Zeile": 39, "Beschreibung": "Vorsteuer aus innergemeinschaftlichem Erwerb", "Kz": 61,
+                               "Betrag (€)": f"{val_61:.2f}"})
+            if val_67:
+                form_f.append({"Zeile": 41, "Beschreibung": "Vorsteuer aus §13b Leistungen", "Kz": 67,
+                               "Betrag (€)": f"{val_67:.2f}"})
+            st.dataframe(form_f, use_container_width=True, hide_index=True)
+
+        # Section H: Vorauszahlung
+        st.markdown("**H. Vorauszahlung/Überschuss**")
+        form_h = [{"Zeile": 50, "Beschreibung": "Verbleibende USt-Vorauszahlung (Kz 83)", "Kz": 83,
+                    "Betrag (€)": f"{zahllast:.2f}"}]
+        st.dataframe(form_h, use_container_width=True, hide_index=True)
+
+        if zahllast > 0:
+            st.info(f"Zahllast: {zahllast:.2f} € an das Finanzamt zu überweisen.")
+        elif zahllast < 0:
+            st.success(f"Erstattung: {abs(zahllast):.2f} € vom Finanzamt.")
+        else:
+            st.caption("Keine Zahllast.")
+
+    st.download_button("📥 Download UStVA XML (ELSTER)", ustva_xml, f"ustva_{sel_year}_{sel_month:02d}.xml", "text/xml")
 
 with tab_euer:
     st.header("EÜR (Jährlich)")
