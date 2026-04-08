@@ -306,11 +306,15 @@ def _full_euro_base(value):
     """
     return int(_to_money(value))
 
-def calculate_ustva_totals(transactions, month, year):
+def calculate_ustva_totals(transactions, months, year):
     """
     Calculates UStVA-relevant sums for a given period.
+    months: single int (e.g. 3) or list of ints (e.g. [1,2,3] for Q1).
     Returns values used both by UI metrics and ELSTER XML generation.
     """
+    if isinstance(months, int):
+        months = [months]
+
     kz_base_sums = {}
     kz_input_tax_sums = {}
     count_relevant = 0
@@ -329,7 +333,7 @@ def calculate_ustva_totals(transactions, month, year):
         if not isinstance(pd, (datetime.date, datetime.datetime)):
             continue
 
-        if pd.year != year or pd.month != month:
+        if pd.year != year or pd.month not in months:
             continue
 
         count_relevant += 1
@@ -386,24 +390,29 @@ def calculate_ustva_totals(transactions, month, year):
         "zahllast": float(zahllast),
     }
 
-def generate_ustva_xml(transactions, month, year, stnr="", name="", vorname="",
-                       strasse="", plz="", ort=""):
+def generate_ustva_xml(transactions, months, year, zeitraum=None, stnr="", name="",
+                       vorname="", strasse="", plz="", ort=""):
     """
     Generates ELSTER UStVA XML for Mein ELSTER import.
-    Filters transactions by payment_date matching month/year.
+    months: single int or list of ints for the period.
+    zeitraum: ELSTER Zeitraum code — "01"-"12" for monthly, "41"-"44" for quarterly.
+              If None, derived from months.
     """
-    totals = calculate_ustva_totals(transactions, month, year)
+    totals = calculate_ustva_totals(transactions, months, year)
     kz_base_rounded = totals["kz_base_rounded"]
     kz_input_tax_sums = totals["kz_input_tax_sums"]
     kz_83 = totals["zahllast"]
 
+    if zeitraum is None:
+        if isinstance(months, int):
+            zeitraum = f"{months:02d}"
+        else:
+            zeitraum = f"{months[0]:02d}"
+
     def fmt_amt(val):
         return f"{val:.2f}"
 
-    ns_url = f"http://finkonsens.de/elster/elsteranmeldung/ustva/v{year}"
-
     root = ET.Element("Anmeldungssteuern", {
-        "xmlns": ns_url,
         "version": str(year)
     })
 
@@ -418,17 +427,24 @@ def generate_ustva_xml(transactions, month, year, stnr="", name="", vorname="",
 
     steuerfall = ET.SubElement(root, "Steuerfall")
 
+    # Unternehmer block matches USt 1 A rows 2-5: Name, Strasse, Ort
+    # (StNr/Vorname are NOT valid child elements in the ELSTER schema)
     unternehmer = ET.SubElement(steuerfall, "Unternehmer")
-    ET.SubElement(unternehmer, "StNr").text = str(stnr or "")
-    ET.SubElement(unternehmer, "Name").text = str(name or "")
-    ET.SubElement(unternehmer, "Vorname").text = str(vorname or "")
+    unternehmer_name = str(name or "")
+    if vorname:
+        unternehmer_name = f"{vorname} {unternehmer_name}"
+    ET.SubElement(unternehmer, "Name").text = unternehmer_name
+    ET.SubElement(unternehmer, "Strasse").text = str(strasse or "")
+    ET.SubElement(unternehmer, "Ort").text = f"{plz} {ort}".strip() if (plz or ort) else ""
 
     ustva = ET.SubElement(steuerfall, "Umsatzsteuervoranmeldung")
 
     ET.SubElement(ustva, "Jahr").text = str(year)
-    ET.SubElement(ustva, "Zeitraum").text = f"{month:02d}"
-    if stnr:
-        ET.SubElement(ustva, "Steuernummer").text = str(stnr)
+    ET.SubElement(ustva, "Zeitraum").text = zeitraum
+    # ELSTER requires Steuernummer as pure digits (13-digit Bundesschema)
+    stnr_clean = "".join(c for c in str(stnr or "") if c.isdigit())
+    if stnr_clean:
+        ET.SubElement(ustva, "Steuernummer").text = stnr_clean
 
     # Bemessungsgrundlagen: full EUR (integer), emit all populated Kz
     # Kz values for base amounts (e.g. 81, 86, 87, 89, 41, ...)
@@ -447,10 +463,16 @@ def generate_ustva_xml(transactions, month, year, stnr="", name="", vorname="",
     # Kz83 is mandatory (Verbleibende USt-Vorauszahlung / Überschuss)
     ET.SubElement(ustva, "Kz83").text = fmt_amt(kz_83)
 
-    xml_bytes = ET.tostring(root, encoding="iso-8859-15", xml_declaration=False)
-    header = b'<?xml version="1.0" encoding="ISO-8859-15" standalone="no"?>\n'
+    # Pretty-print for readability and compatibility
+    try:
+        ET.indent(root)
+    except AttributeError:
+        pass  # ET.indent requires Python 3.9+
 
-    return header + xml_bytes
+    xml_bytes = ET.tostring(root, encoding="unicode")
+    header = '<?xml version="1.0" encoding="UTF-8"?>\n'
+
+    return (header + xml_bytes).encode("utf-8")
 
 def generate_euer_xml(transactions, year):
     """

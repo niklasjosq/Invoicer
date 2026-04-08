@@ -1,13 +1,15 @@
-# Factur-X / ZUGFeRD Generator & API
+# Factur-X / ZUGFeRD Invoice Manager
 
-This project provides both a **Streamlit Web UI** for manual invoice creation and a **FastAPI backend** for automated XML generation. Both tools produce strict Factur-X Basic Profile XML compliant with EN 16931 and XRechnung.
+Streamlit-based invoice management with ZUGFeRD/Factur-X PDF generation, ELSTER UStVA/EÜR tax reporting, and a FastAPI backend for automated XML generation.
 
 ## Features
 
--   **Streamlit Web UI**: User-friendly interface for manual data entry, history persistence, XML preview, and PDF viewing.
--   **FastAPI Backend**: High-performance asynchronous API for automated invoice generation via JSON.
--   **Strict Compliance**: Generates Factur-X Basic Profile XML (`urn:cen.eu:en16931:2017#compliant#urn:factur-x.eu:1p0:basic`).
--   **XRechnung Ready**: Supports Project IDs (BT-18), Purchase Order IDs (BT-13), Due Dates (BT-9), and mandatory party details.
+- **Invoice Generation**: Create Factur-X Basic Profile invoices (EN 16931, XRechnung-ready) with embedded ZUGFeRD XML
+- **Accounting / Tax Reporting**: UStVA generation (monthly or quarterly) with ELSTER XML export, EÜR annual overview
+- **Incoming Invoices**: Upload ZUGFeRD PDFs or manually enter non-ZUGFeRD invoices, auto-categorize by ELSTER Kennzahlen
+- **Payment Tracking**: CLI tool to scan invoices on disk and assign payment dates, or manage directly in the UI
+- **History & Prefill**: Sender/recipient/footer templates with one-click prefill across invoice creation and tax forms
+- **FastAPI Backend**: REST API for automated invoice XML generation
 
 ## Installation
 
@@ -18,20 +20,33 @@ uv sync
 ## Usage
 
 ### 1. Web UI (Streamlit)
-To run the interactive web interface:
 ```bash
 uv run streamlit run invoice_app/app.py
 ```
 
-### 2. Web API (FastAPI)
-To run the backend API service:
+Tabs:
+- **Input Data** -- Create outgoing invoices (ZUGFeRD PDF with embedded XML)
+- **XML / PDF Preview** -- Review generated XML and PDF before download
+- **Scanner** -- Scan a directory for invoice PDFs/XMLs and import into transactions
+- **UStVA** -- Monthly or quarterly Umsatzsteuervoranmeldung with ELSTER XML download
+- **EÜR** -- Annual income/expense overview
+
+### 2. Payment Date Manager (CLI)
+```bash
+uv run python manage_payments.py                # interactive mode
+uv run python manage_payments.py --list         # list invoices missing payment dates
+uv run python manage_payments.py --all          # show all transactions
+uv run python manage_payments.py --id INV-001   # set/clear date for a single invoice
+uv run python manage_payments.py --dir /path    # scan a specific directory
+```
+Writes directly to `transactions.json` -- the Streamlit app picks up changes on next load.
+
+### 3. Web API (FastAPI)
 ```bash
 uv run uvicorn invoice_app.api:app --host 0.0.0.0 --port 8000
 ```
-Send a `POST` request to `http://localhost:8000/generate-xml`.
 
-### Example Request
-
+POST to `/generate-xml`:
 ```json
 {
   "id": "INV-2026-001",
@@ -47,12 +62,7 @@ Send a `POST` request to `http://localhost:8000/generate-xml`.
     "customer_id": "CUST-99"
   },
   "items": [
-    {
-      "name": "Project Management",
-      "qty": 10.0,
-      "price": 120.0,
-      "vat_percent": 19.0
-    }
+    { "name": "Project Management", "qty": 10.0, "price": 120.0, "vat_percent": 19.0 }
   ],
   "currency": "EUR"
 }
@@ -63,11 +73,15 @@ Send a `POST` request to `http://localhost:8000/generate-xml`.
 ```text
 Invoicer/
 ├── invoice_app/
-│   ├── app.py            # Streamlit Web User Interface
-│   ├── api.py            # FastAPI Web API
-│   └── invoice_logic.py  # Shared Factur-X / ZUGFeRD generation logic
-├── pyproject.toml        # Project dependencies & tool config
-└── README.md             # Project documentation
+│   ├── app.py              # Streamlit Web UI (invoices, scanner, UStVA, EÜR)
+│   ├── api.py              # FastAPI REST API
+│   ├── invoice_logic.py    # Factur-X / ZUGFeRD PDF + XML generation
+│   └── accounting_logic.py # UStVA / EÜR calculation, ELSTER XML, invoice extraction
+├── manage_payments.py      # CLI tool for payment date management
+├── transactions.json       # Invoice & payment data (gitignored)
+├── invoice_history.json    # Sender/recipient/footer templates (gitignored)
+├── pyproject.toml          # Dependencies & tool config
+└── README.md
 ```
 
 ## License

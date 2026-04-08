@@ -139,15 +139,31 @@ if "zugferd_pdf" not in st.session_state:
 if "line_items_list" not in st.session_state:
     st.session_state.line_items_list = [DEFAULT_ITEM.copy()]
 
-tab_input, tab_xml, tab_pdf, tab_scanner, tab_ustva, tab_euer = st.tabs(["📝 Input Data", "📄 XML Preview", "👁️ PDF Preview", "📂 Scanner", "📈 UStVA (Monatlich)", "📊 EÜR (Jährlich)"])
+tab_input, tab_xml, tab_pdf, tab_scanner, tab_ustva, tab_euer = st.tabs(["📝 Input Data", "📄 XML Preview", "👁️ PDF Preview", "📂 Scanner", "📈 UStVA", "📊 EÜR (Jährlich)"])
 
 with tab_input:
     st.header("Input Data")
-    
+
     history = load_history()
-    
+
+    # Initialize widget defaults in session state (once)
+    _defaults = {
+        "sender_name_area": "My Company GmbH\nMain Street 1\n12345 Berlin",
+        "sender_tax_id_in": "DE123456789",
+        "recipient_name_area": "Client Corp\nSecond Street 2\n80331 Munich",
+        "customer_id_in": "CUST-001",
+        "iban_in": "DE12 3456 7890 1234 5678 90",
+        "bic_in": "TESTDEFF",
+        "f_col1": "Tax Office: Berlin-Mitte\nTax ID: 12/345/67890",
+        "f_col2": "Payment terms: 14 days net.\nPlease transfer to IBAN listed.",
+        "f_col3": "Email: info@mycompany.de\nPhone: +49 30 123456",
+    }
+    for _k, _v in _defaults.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
     col_s, col_r = st.columns(2)
-    
+
     with col_s:
         st.subheader("Sender")
         sender_options = ["Select from History..."] + [s["name_address"].split('\n')[0] for s in history.get("senders", [])]
@@ -159,8 +175,8 @@ with tab_input:
                 st.session_state.sender_tax_id_in = selected["tax_id"]
 
         st.selectbox("History (Sender)", options=range(len(sender_options)), format_func=lambda x: sender_options[x], key="sender_select_idx", on_change=on_sender_change)
-        s_name_addr = st.text_area("Name & Address", key="sender_name_area", value="My Company GmbH\nMain Street 1\n12345 Berlin")
-        s_tax = st.text_input("VAT ID", key="sender_tax_id_in", value="DE123456789")
+        s_name_addr = st.text_area("Name & Address", key="sender_name_area")
+        s_tax = st.text_input("VAT ID", key="sender_tax_id_in")
         
         st.markdown("---")
         st.write("Firmenlogo (Rechts oben)")
@@ -191,8 +207,8 @@ with tab_input:
                 st.session_state.customer_id_in = selected["customer_id"]
 
         st.selectbox("History (Recipient)", options=range(len(recipient_options)), format_func=lambda x: recipient_options[x], key="recipient_select_idx", on_change=on_recipient_change)
-        r_name_addr = st.text_area("Name & Address", key="recipient_name_area", value="Client Corp\nSecond Street 2\n80331 Munich")
-        r_cust = st.text_input("Customer ID", key="customer_id_in", value="CUST-001")
+        r_name_addr = st.text_area("Name & Address", key="recipient_name_area")
+        r_cust = st.text_input("Customer ID", key="customer_id_in")
 
     st.subheader("Invoice Details")
     c1, c2, c3 = st.columns(3)
@@ -229,13 +245,13 @@ with tab_input:
     st.selectbox("History (Footer)", options=range(len(footer_options)), format_func=lambda x: footer_options[x], key="footer_select_idx", on_change=on_footer_change)
     
     f1, f2 = st.columns(2)
-    iban = f1.text_input("IBAN", key="iban_in", value="DE12 3456 7890 1234 5678 90")
-    bic = f2.text_input("BIC", key="bic_in", value="TESTDEFF")
-    
+    iban = f1.text_input("IBAN", key="iban_in")
+    bic = f2.text_input("BIC", key="bic_in")
+
     col1, col2, col3 = st.columns(3)
-    f_col1 = col1.text_area("Footer Col 1 (Notes)", key="f_col1", value="Tax Office: Berlin-Mitte\nTax ID: 12/345/67890")
-    f_col2 = col2.text_area("Footer Col 2 (Terms)", key="f_col2", value="Payment terms: 14 days net.\nPlease transfer to IBAN listed.")
-    f_col3 = col3.text_area("Footer Col 3 (Contact)", key="f_col3", value="Email: info@mycompany.de\nPhone: +49 30 123456")
+    f_col1 = col1.text_area("Footer Col 1 (Notes)", key="f_col1")
+    f_col2 = col2.text_area("Footer Col 2 (Terms)", key="f_col2")
+    f_col3 = col3.text_area("Footer Col 3 (Contact)", key="f_col3")
 
     if st.button("Generate Invoice", type="primary"):
         s_parts = [l.strip() for l in s_name_addr.split("\n") if l.strip()]
@@ -479,27 +495,73 @@ with tab_scanner:
         st.caption("Scan a directory to find and review invoices before importing.")
 
 with tab_ustva:
-    st.header("UStVA (Monatlich)")
-    
-    col_u1, col_u2 = st.columns(2)
+    st.header("UStVA")
+
+    QUARTER_MONTHS = {1: [1, 2, 3], 2: [4, 5, 6], 3: [7, 8, 9], 4: [10, 11, 12]}
+    QUARTER_ZEITRAUM = {1: "41", 2: "42", 3: "43", 4: "44"}
+
+    col_u0, col_u1, col_u2 = st.columns([1, 1, 1])
+    ustva_mode = col_u0.radio("Voranmeldungszeitraum", ["Monatlich", "Vierteljährlich"], key="ustva_mode", horizontal=True)
     sel_year = col_u1.number_input("Jahr", 2020, 2030, datetime.date.today().year, key="ustva_year")
-    sel_month = col_u2.selectbox("Monat", range(1, 13), index=datetime.date.today().month-1, key="ustva_month")
+
+    if ustva_mode == "Monatlich":
+        sel_month = col_u2.selectbox("Monat", range(1, 13), index=datetime.date.today().month - 1, key="ustva_month")
+        sel_months = [sel_month]
+        sel_zeitraum = f"{sel_month:02d}"
+        period_label = f"{sel_month:02d}/{sel_year}"
+    else:
+        current_quarter = (datetime.date.today().month - 1) // 3 + 1
+        sel_quarter = col_u2.selectbox("Quartal", [1, 2, 3, 4], index=current_quarter - 1, key="ustva_quarter", format_func=lambda q: f"Q{q} ({QUARTER_MONTHS[q][0]:02d}-{QUARTER_MONTHS[q][-1]:02d})")
+        sel_months = QUARTER_MONTHS[sel_quarter]
+        sel_zeitraum = QUARTER_ZEITRAUM[sel_quarter]
+        period_label = f"Q{sel_quarter}/{sel_year}"
 
     st.markdown("### Steuerfall (Unternehmer)")
-    sender_default_name = ""
-    sender_name_area = st.session_state.get("sender_name_area", "")
-    if sender_name_area:
-        sender_default_name = sender_name_area.split("\n")[0].strip()
-    if "ustva_name" not in st.session_state and sender_default_name:
-        st.session_state.ustva_name = sender_default_name
+
+    ustva_history = load_history()
+    ustva_sender_options = ["Aus History wählen..."] + [
+        s["name_address"].split("\n")[0] for s in ustva_history.get("senders", [])
+    ]
+
+    def on_ustva_sender_change():
+        idx = st.session_state.ustva_sender_select_idx
+        if idx > 0:
+            selected = ustva_history["senders"][idx - 1]
+            lines = [l.strip() for l in selected["name_address"].split("\n") if l.strip()]
+            st.session_state.ustva_name = lines[0] if lines else ""
+            st.session_state.ustva_strasse = lines[1] if len(lines) > 1 else ""
+            # Parse "PLZ Ort" from address line
+            if len(lines) > 2:
+                plz_ort = lines[2]
+                parts = plz_ort.split(" ", 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    st.session_state.ustva_plz = parts[0]
+                    st.session_state.ustva_ort = parts[1]
+                else:
+                    st.session_state.ustva_plz = ""
+                    st.session_state.ustva_ort = plz_ort
+            st.session_state.ustva_stnr = selected.get("tax_id", "")
+
+    st.selectbox(
+        "History (Absender)",
+        options=range(len(ustva_sender_options)),
+        format_func=lambda x: ustva_sender_options[x],
+        key="ustva_sender_select_idx",
+        on_change=on_ustva_sender_change,
+    )
+
     col_tax_1, col_tax_2, col_tax_3 = st.columns(3)
     ustva_stnr = col_tax_1.text_input(
-        "Steuernummer (StNr)",
+        "Steuernummer (13-stellig, Bundesschema)",
         key="ustva_stnr",
-        help="Wird im XML als <Unternehmer><StNr>...</StNr> gesetzt.",
+        help="ELSTER erfordert die 13-stellige Bundeseinheitliche Steuernummer, z.B. 2614082562547. Zu finden in Mein ELSTER oder auf dem Steuerbescheid.",
     )
     ustva_name = col_tax_2.text_input("Nachname/Firmenname", key="ustva_name")
     ustva_vorname = col_tax_3.text_input("Vorname", key="ustva_vorname")
+
+    stnr_digits = "".join(c for c in ustva_stnr if c.isdigit())
+    if ustva_stnr and len(stnr_digits) != 13:
+        st.warning(f"Steuernummer hat {len(stnr_digits)} Ziffern — ELSTER erfordert genau 13 (Bundesschema).")
 
     st.markdown("### Adresse (DatenLieferant)")
     col_addr1, col_addr2, col_addr3 = st.columns(3)
@@ -532,6 +594,51 @@ with tab_ustva:
                 save_transactions(current_txs)
                 st.success(f"{len(new_txs)} Rechnungen hinzugefügt.")
                 st.rerun()
+
+    st.markdown("### Eingangsrechnung manuell erfassen")
+    st.caption("Für Rechnungen ohne ZUGFeRD/XRechnung XML (einfache PDFs).")
+
+    eingangs_categories = [k for k, v in KATEGORIE_MAPPING.items() if v["type"] == "Ausgabe"]
+
+    with st.form("manual_eingang_form"):
+        col_m1, col_m2, col_m3 = st.columns(3)
+        m_id = col_m1.text_input("Rechnungs-Nr.")
+        m_date = col_m2.date_input("Rechnungsdatum", value=datetime.date.today())
+        m_partner = col_m3.text_input("Partner / Lieferant")
+
+        col_m4, col_m5, col_m6 = st.columns(3)
+        m_net = col_m4.number_input("Netto (€)", min_value=0.0, step=0.01, format="%.2f")
+        m_tax = col_m5.number_input("MwSt (€)", min_value=0.0, step=0.01, format="%.2f")
+        m_gross = col_m6.number_input("Brutto (€)", min_value=0.0, step=0.01, format="%.2f")
+
+        col_m7, col_m8 = st.columns(2)
+        m_category = col_m7.selectbox("Kategorie", options=eingangs_categories)
+        m_payment_date = col_m8.date_input("Zahldatum (optional)", value=None)
+
+        submitted = st.form_submit_button("Eingangsrechnung hinzufügen")
+        if submitted:
+            if not m_id:
+                st.error("Bitte eine Rechnungs-Nr. angeben.")
+            elif m_net <= 0 and m_gross <= 0:
+                st.error("Bitte mindestens Netto- oder Bruttobetrag angeben.")
+            else:
+                manual_tx = {
+                    "id": m_id,
+                    "date": m_date.strftime("%Y-%m-%d"),
+                    "partner": m_partner,
+                    "net_amount": m_net,
+                    "tax_amount": m_tax,
+                    "gross_amount": m_gross,
+                    "type": "Ausgabe",
+                    "payment_date": m_payment_date.strftime("%Y-%m-%d") if m_payment_date else None,
+                    "category": m_category,
+                    "vat_id": "",
+                }
+                if add_transaction(manual_tx):
+                    st.success(f"Rechnung {m_id} hinzugefügt.")
+                    st.rerun()
+                else:
+                    st.warning(f"Rechnung {m_id} bereits vorhanden.")
 
     st.markdown("### Transaktionen bearbeiten")
     st.info("Setze das 'Payment Date', um die Rechnung in die UStVA/EÜR aufzunehmen.")
@@ -659,8 +766,9 @@ with tab_ustva:
     # Filter by Payment Date in selected Month/Year
     ustva_xml = generate_ustva_xml(
         edited_txs,
-        sel_month,
+        sel_months,
         sel_year,
+        zeitraum=sel_zeitraum,
         stnr=ustva_stnr,
         name=ustva_name,
         vorname=ustva_vorname,
@@ -668,9 +776,9 @@ with tab_ustva:
         plz=ustva_plz,
         ort=ustva_ort,
     )
-    
+
     # Calculate UStVA metrics matching ELSTER logic
-    totals = calculate_ustva_totals(edited_txs, sel_month, sel_year)
+    totals = calculate_ustva_totals(edited_txs, sel_months, sel_year)
     count_relevant = totals["count_relevant"]
     kz_base_sums = totals["kz_base_sums"]
     kz_input_tax_sums = totals["kz_input_tax_sums"]
@@ -678,7 +786,7 @@ with tab_ustva:
     sum_input_tax = totals["sum_input_tax"]
     zahllast = totals["zahllast"]
     
-    st.caption(f"Berechnungsgrundlage: {count_relevant} Buchungen im Zeitraum {sel_month:02d}/{sel_year}.")
+    st.caption(f"Berechnungsgrundlage: {count_relevant} Buchungen im Zeitraum {period_label}.")
     # Debug info (can be removed later)
     if count_relevant > 0 and sum_sales_vat == 0 and sum_input_tax == 0:
         st.warning("Keine Steuer berechnet. Prüfe Kategorien:")
@@ -689,11 +797,12 @@ with tab_ustva:
     m1.metric("Umsatzsteuer (Einnahmen)", f"{sum_sales_vat:.2f} €")
     m2.metric("Vorsteuer (Ausgaben)", f"{sum_input_tax:.2f} €")
     m3.metric("Zahllast", f"{zahllast:.2f} €", delta_color="inverse")
+    st.caption("Hinweis: Die Umsatzsteuer wird aus der auf volle EUR abgerundeten Bemessungsgrundlage (Kz 81/86/89) berechnet, nicht aus der Summe der einzelnen MwSt-Beträge. Geringe Abweichungen sind ELSTER-konform.")
 
     # Visual UStVA form preview matching official USt 1 A
     kz_base_rounded = totals["kz_base_rounded"]
     with st.expander("📋 UStVA Formular (Vorschau)", expanded=False):
-        st.caption(f"Voranmeldungszeitraum: {sel_month:02d}/{sel_year}")
+        st.caption(f"Voranmeldungszeitraum: {period_label}")
 
         # Section A: Steuerpflichtige Umsätze
         base_81 = kz_base_rounded.get("81", 0)
@@ -760,7 +869,7 @@ with tab_ustva:
         else:
             st.caption("Keine Zahllast.")
 
-    st.download_button("📥 Download UStVA XML (ELSTER)", ustva_xml, f"ustva_{sel_year}_{sel_month:02d}.xml", "text/xml")
+    st.download_button("📥 Download UStVA XML (ELSTER)", ustva_xml, f"ustva_{sel_year}_{sel_zeitraum}.xml", "text/xml")
 
 with tab_euer:
     st.header("EÜR (Jährlich)")
