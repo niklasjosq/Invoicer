@@ -84,6 +84,10 @@ def scan_directory(scan_dir):
         except Exception:
             data = None
         if data and data.get("id"):
+            method = data.pop("_extraction_method", None)
+            conf = data.pop("_extraction_confidence", None)
+            if method and method != "zugferd":
+                print(f"    {os.path.basename(fpath)}: [{method}, {conf:.0%} confidence]")
             results.append(data)
     return results
 

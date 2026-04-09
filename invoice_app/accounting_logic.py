@@ -133,6 +133,25 @@ KATEGORIE_MAPPING = {
     },
 }
 
+_EU_PREFIXES = [
+    "AT", "BE", "BG", "CY", "CZ", "DK", "EE", "ES", "FI", "FR",
+    "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL",
+    "PL", "PT", "RO", "SE", "SI", "SK",
+]
+
+
+def _apply_category_heuristic(vat_id: str) -> str:
+    """Determine ELSTER category from supplier VAT ID prefix."""
+    category = "Ein: Übrige Betriebsausgaben"
+    if vat_id:
+        prefix = vat_id[:2].upper()
+        if prefix != "DE" and prefix in _EU_PREFIXES:
+            category = "Ein: Innergemeinschaftlicher Erwerb 19%"
+        elif prefix == "DE":
+            category = "Ein: Vorsteuer (Dienstleistungen) 19%"
+    return category
+
+
 def parse_facturx_xml(xml_content):
     """
     Parses Factur-X/ZUGFeRD XML content (bytes or string) and returns a transaction dictionary.
@@ -179,18 +198,7 @@ def parse_facturx_xml(xml_content):
             if first_tid is not None:
                 seller_vat_id = first_tid.text
 
-        # Heuristic for Category (incoming invoices are Ausgabe/Eingangsrechnungen)
-        category = "Ein: Übrige Betriebsausgaben"
-        # If Seller is non-German EU -> Innergemeinschaftlicher Erwerb
-        # Common EU prefixes: AT, BE, BG, CY, CZ, DK, EE, ES, FI, FR, GR, HR, HU, IE, IT, LT, LU, LV, MT, NL, PL, PT, RO, SE, SI, SK
-        eu_prefixes = ["AT", "BE", "BG", "CY", "CZ", "DK", "EE", "ES", "FI", "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK"]
-        
-        if seller_vat_id:
-            prefix = seller_vat_id[:2].upper()
-            if prefix != "DE" and prefix in eu_prefixes:
-                category = "Ein: Innergemeinschaftlicher Erwerb 19%"
-            elif prefix == "DE":
-                category = "Ein: Vorsteuer (Dienstleistungen) 19%"  # Default for domestic, assume services
+        category = _apply_category_heuristic(seller_vat_id)
 
         # Amounts
         # GrandTotalAmount is Gross
@@ -230,8 +238,10 @@ def extract_data_from_xml_file(xml_path):
 
 def extract_data_from_pdf(pdf_input):
     """
-    Extracts invoice data from an embedded Factur-X/ZUGFeRD XML in a PDF.
+    Extracts invoice data from a PDF.
+    Tries: 1) ZUGFeRD/XRechnung XML, 2) text extraction (regex/LLM).
     Accepts bytes or file path (str).
+    Returns dict with transaction fields plus _extraction_method/_extraction_confidence, or None.
     """
     try:
         if isinstance(pdf_input, str):
@@ -239,39 +249,57 @@ def extract_data_from_pdf(pdf_input):
                 pdf_bytes = f.read()
         else:
             pdf_bytes = pdf_input
-            
-        reader = PdfReader(BytesIO(pdf_bytes))
-        root = reader.trailer["/Root"]
-        
+
+        # --- Tier 1: ZUGFeRD/XRechnung XML ---
         xml_content = None
-        
-        # pypdf > 3.0 approach for attachments
-        if reader.attachments:
-            for filename, data in reader.attachments.items():
-                if filename.lower() in ["factur-x.xml", "zugferd-invoice.xml", "xrechnung.xml"]:
-                    xml_content = data[0] # pypdf returns [bytes, dict]
-                    break
-        
-        # Fallback
-        if not xml_content:
-            try:
-                names = root["/Names"]
-                embedded = names["/EmbeddedFiles"]
-                name_array = embedded["/Names"]
-                for i in range(0, len(name_array), 2):
-                    fname = name_array[i]
-                    if fname.lower() in ["factur-x.xml", "zugferd-invoice.xml", "xrechnung.xml"]:
-                        file_spec = name_array[i+1].get_object()
-                        xml_content = file_spec["/EF"]["/F"].get_object().get_data()
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+            root = reader.trailer["/Root"]
+
+            if reader.attachments:
+                for filename, data in reader.attachments.items():
+                    if filename.lower() in ["factur-x.xml", "zugferd-invoice.xml", "xrechnung.xml"]:
+                        xml_content = data[0]
                         break
-            except:
-                pass
 
-        if not xml_content:
-            return None
+            if not xml_content:
+                try:
+                    names = root["/Names"]
+                    embedded = names["/EmbeddedFiles"]
+                    name_array = embedded["/Names"]
+                    for i in range(0, len(name_array), 2):
+                        fname = name_array[i]
+                        if fname.lower() in ["factur-x.xml", "zugferd-invoice.xml", "xrechnung.xml"]:
+                            file_spec = name_array[i + 1].get_object()
+                            xml_content = file_spec["/EF"]["/F"].get_object().get_data()
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-        return parse_facturx_xml(xml_content)
-        
+        if xml_content:
+            result = parse_facturx_xml(xml_content)
+            if result:
+                result["_extraction_method"] = "zugferd"
+                result["_extraction_confidence"] = 1.0
+                return result
+
+        # --- Tier 2+3: Text extraction with regex/LLM fallback ---
+        from invoice_app.pdf_text_extract import extract_invoice_from_text
+
+        text_result, method, confidence = extract_invoice_from_text(pdf_bytes)
+        if text_result and confidence >= 0.3:
+            text_result.setdefault("type", "Ausgabe")
+            text_result.setdefault("payment_date", None)
+            text_result.setdefault("vat_id", "")
+            text_result["category"] = _apply_category_heuristic(text_result.get("vat_id", ""))
+            text_result["_extraction_method"] = method
+            text_result["_extraction_confidence"] = confidence
+            return text_result
+
+        return None
+
     except Exception as e:
         print(f"Error extracting PDF data: {e}")
         return None

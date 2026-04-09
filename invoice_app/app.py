@@ -401,13 +401,15 @@ with tab_scanner:
                     data = extract_data_from_xml_file(fpath)
 
                 if data:
-                    if data["id"] and data["id"] not in current_ids:
+                    if data.get("id") and data["id"] not in current_ids:
                         data["_import"] = True  # Checkbox default
                         data["_source"] = os.path.basename(fpath)
                         scanned.append(data)
                         current_ids.add(data["id"])
                     else:
                         skipped.append({"file": os.path.basename(fpath), "id": data.get("id", "?"), "reason": "Already imported"})
+                else:
+                    skipped.append({"file": os.path.basename(fpath), "id": "—", "reason": "Could not extract data"})
 
                 progress_bar.progress((i + 1) / len(found_files))
 
@@ -417,7 +419,7 @@ with tab_scanner:
 
     # Show skipped files
     if st.session_state.scan_skipped:
-        with st.expander(f"⏭️ Skipped {len(st.session_state.scan_skipped)} duplicates"):
+        with st.expander(f"⏭️ Skipped {len(st.session_state.scan_skipped)} file(s)"):
             st.dataframe(st.session_state.scan_skipped, use_container_width=True)
 
     # Interactive review table
@@ -425,15 +427,28 @@ with tab_scanner:
         st.subheader(f"📋 Review {len(st.session_state.scanned_invoices)} scanned invoices")
         st.info("Review and adjust categories, set payment dates, then import selected invoices.")
 
+        # Show warnings for low-confidence extractions
+        low_conf = [s for s in st.session_state.scanned_invoices
+                     if s.get("_extraction_confidence", 1.0) < 0.7]
+        if low_conf:
+            st.warning(
+                f"⚠️ {len(low_conf)} invoice(s) extracted with low confidence — please review carefully."
+            )
+
         scanner_col_config = {
             "_import": st.column_config.CheckboxColumn("Import", default=True),
             "_source": st.column_config.TextColumn("Source File", disabled=True),
-            "id": st.column_config.TextColumn("Invoice Nr.", disabled=True),
-            "date": st.column_config.TextColumn("Invoice Date", disabled=True),
-            "partner": st.column_config.TextColumn("Partner", disabled=True),
-            "net_amount": st.column_config.NumberColumn("Net (€)", format="%.2f €", disabled=True),
-            "tax_amount": st.column_config.NumberColumn("VAT (€)", format="%.2f €", disabled=True),
-            "gross_amount": st.column_config.NumberColumn("Gross (€)", format="%.2f €", disabled=True),
+            "_extraction_method": st.column_config.TextColumn("Method", disabled=True,
+                                                              help="zugferd, regex, or llm"),
+            "_extraction_confidence": st.column_config.ProgressColumn(
+                "Conf.", min_value=0.0, max_value=1.0, format="%.0f%%",
+            ),
+            "id": st.column_config.TextColumn("Invoice Nr."),
+            "date": st.column_config.TextColumn("Invoice Date"),
+            "partner": st.column_config.TextColumn("Partner"),
+            "net_amount": st.column_config.NumberColumn("Net (€)", format="%.2f €"),
+            "tax_amount": st.column_config.NumberColumn("VAT (€)", format="%.2f €"),
+            "gross_amount": st.column_config.NumberColumn("Gross (€)", format="%.2f €"),
             "type": st.column_config.SelectboxColumn("Type", options=["Einnahme", "Ausgabe"], required=True),
             "payment_date": st.column_config.DateColumn(
                 "Payment Date",
@@ -450,7 +465,8 @@ with tab_scanner:
             "vat_id": st.column_config.TextColumn("VAT ID", disabled=True),
         }
 
-        column_order = ["_import", "_source", "id", "date", "partner", "net_amount", "tax_amount",
+        column_order = ["_import", "_source", "_extraction_method", "_extraction_confidence",
+                        "id", "date", "partner", "net_amount", "tax_amount",
                         "gross_amount", "type", "payment_date", "category"]
 
         edited_scanned = st.data_editor(
@@ -570,25 +586,34 @@ with tab_ustva:
     ustva_ort = col_addr3.text_input("Ort", key="ustva_ort")
     
     st.markdown("### Eingangsrechnungen hochladen")
-    uploaded_files = st.file_uploader("ZUGFeRD/XRechnung PDFs", accept_multiple_files=True, type="pdf")
-    
+    uploaded_files = st.file_uploader("Eingangsrechnungen (PDF)", accept_multiple_files=True, type="pdf")
+
     if uploaded_files:
         if st.button("Verarbeite Uploads"):
             new_txs = []
             current_txs = load_transactions()
             current_ids = [t["id"] for t in current_txs]
-            
+
             for uf in uploaded_files:
                 data = extract_data_from_pdf(uf.getvalue())
                 if data:
-                    if data["id"] not in current_ids:
-                        new_txs.append(data)
-                        current_ids.append(data["id"])
+                    method = data.get("_extraction_method", "unknown")
+                    confidence = data.get("_extraction_confidence", 1.0)
+                    # Strip internal metadata before saving
+                    tx = {k: v for k, v in data.items() if not k.startswith("_")}
+                    if tx.get("id") and tx["id"] not in current_ids:
+                        new_txs.append(tx)
+                        current_ids.append(tx["id"])
+                        if confidence < 0.7:
+                            st.warning(
+                                f"⚠️ {uf.name}: extrahiert via {method} "
+                                f"(Konfidenz {confidence:.0%}) — bitte prüfen."
+                            )
                     else:
-                        st.warning(f"Rechnung {data['id']} bereits vorhanden.")
+                        st.warning(f"Rechnung {tx.get('id', '?')} bereits vorhanden.")
                 else:
-                    st.error(f"Konnte keine ZUGFeRD Daten aus {uf.name} lesen.")
-            
+                    st.error(f"Konnte keine Rechnungsdaten aus {uf.name} extrahieren. Bitte manuell erfassen.")
+
             if new_txs:
                 current_txs.extend(new_txs)
                 save_transactions(current_txs)
@@ -596,7 +621,6 @@ with tab_ustva:
                 st.rerun()
 
     st.markdown("### Eingangsrechnung manuell erfassen")
-    st.caption("Für Rechnungen ohne ZUGFeRD/XRechnung XML (einfache PDFs).")
 
     eingangs_categories = [k for k, v in KATEGORIE_MAPPING.items() if v["type"] == "Ausgabe"]
 
